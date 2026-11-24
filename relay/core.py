@@ -9,6 +9,7 @@ from graphlib import CycleError, TopologicalSorter
 from urllib.parse import urlsplit
 
 from .config import Config, ROLES
+from .issue_format import render_issue
 
 STATUSES = ("Todo", "In Progress", "In Review", "Blocked", "Done", "Cancelled")
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
@@ -116,6 +117,8 @@ def validate_task(task: Task) -> None:
             not isinstance(value, str) or datetime.fromisoformat(value).utcoffset() is None
         ):
             raise ValueError(f"{task.key}: {name} must include a UTC offset")
+
+    render_issue(task)  # Preflight the same text that will be sent to GitHub.
 
 
 def validate_tasks(tasks: list[Task]) -> None:

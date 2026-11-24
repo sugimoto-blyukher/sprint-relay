@@ -1,5 +1,3 @@
-import base64
-import json
 from copy import deepcopy
 from dataclasses import replace
 
@@ -168,19 +166,25 @@ def test_idempotent_private_spec_archive(service):
     assert len(api.files) == 1
 
 
-def test_project_fallback_and_retry(service):
+def test_project_fallback_and_retry(service, monkeypatch):
+    monkeypatch.setattr("relay.github.time.time", lambda: 0)
     svc, api = service
     svc.config.project_id = "project"
     api.project_error = True
     created = svc.publish([task()])[0]
     assert created.issue and "Projects sync delayed" in svc.notifications()[0][1]
     api.project_error = False
+    svc.update(replace(created, forecast_start="2026-01-01T21:00:00+00:00"), created)
     svc.poll()
     gql = [data for _, path, data in api.calls if path == "/graphql"]
     assert any(data["variables"].get("v") == {"singleSelectOptionId": "todo"} for data in gql)
+    assert any(data["variables"].get("v") == {"date": "2026-01-02"} for data in gql)
     count = len(gql)
     svc.poll()
     assert sum(path == "/graphql" for _, path, _ in api.calls) == count
+    monkeypatch.setattr("relay.github.time.time", lambda: 3601)
+    svc.poll()
+    assert sum(path == "/graphql" for _, path, _ in api.calls) > count
 
 
 def test_start_checks_dependencies_and_design_claims(service):
@@ -192,3 +196,47 @@ def test_start_checks_dependencies_and_design_claims(service):
     svc.action("A", "cancel", "2", "obsolete")
     with pytest.raises(ValueError, match="cancelled"):
         svc.action("B", "start", "2")
+
+
+def test_retry_approved_change_after_new_progress(service):
+    svc, api = service
+    original = svc.publish([task()])[0]
+    patch = [(original, replace(original, title="Clarified guide"))]
+    svc.publish_changes([], patch, operation_id="validated-revision")
+    started = svc.action("T1", "start", "1")
+    assert svc.publish_changes([], patch, operation_id="validated-revision") == [started]
+
+
+def test_recovery_refuses_ambiguous_markers(service):
+    svc, api = service
+    api.lose_response = True
+    with pytest.raises(TimeoutError):
+        svc.publish([task()])
+    api.issues[2] = {**api.issues[1], "number": 2}
+    with pytest.raises(Conflict, match="ambiguous"):
+        svc.publish([task()])
+    assert len(api.issues) == 2
+    assert svc.list_tasks()[0].issue is None
+
+
+def test_preserve_issue_notes_when_rendering_or_repairing_markers(service):
+    svc, api = service
+    svc.publish([task(description="Include <!-- /sprint-relay --> in examples.")])
+    issue = api.issues[1]
+    assert "&lt;!-- /sprint-relay -->" in issue["body"]
+    issue["body"] = "Outside note\n" + issue["body"]
+    issue["body"] = issue["body"].replace("**Acceptance**", "Human note inside the block")
+    issue["title"] = "Human title"
+    svc.poll()
+    original = issue["body"]
+    for note in ("Outside note", "Human note inside the block", "Human title"):
+        assert original.count(note) == 1
+    svc.poll()
+    assert issue["body"] == original
+    # Missing closing boundary: preserve remaining text and restore a usable block.
+    issue["body"] = original.split("<!-- /sprint-relay:", 1)[0] + "Repair me"
+    svc.poll()
+    assert "Repair me" in issue["body"]
+    repaired = issue["body"]
+    svc.poll()
+    assert issue["body"] == repaired

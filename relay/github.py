@@ -7,14 +7,18 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from .core import Task, apply_action, assign_owner, validate_tasks
+from .issue_format import BODY_LIMIT, render_issue
 
 
 class GitHubError(RuntimeError):
@@ -25,6 +29,10 @@ class GitHubError(RuntimeError):
 
 class Conflict(ValueError):
     """The caller must read the current task and reconsider its change."""
+
+
+class PlanConflict(Conflict):
+    """The approved graph change has not been applied and may be reclassified."""
 
 
 def transport(token):
@@ -82,6 +90,9 @@ class GitHub:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS relay_projection (key TEXT PRIMARY KEY, hash TEXT)"
             )
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS relay_issue_cache (key TEXT PRIMARY KEY, title TEXT, body_hash TEXT)"
+            )
         self._ledger = f"/repos/{config.management_repo}/contents/.sprint-relay/tasks.json"
 
     def _load(self):
@@ -131,7 +142,7 @@ class GitHub:
         """Reserve the entire validated batch before making any product issues."""
         return self.publish_changes(tasks, [])
 
-    def publish_changes(self, new_tasks, updates):
+    def publish_changes(self, new_tasks, updates, *, operation_id=None):
         """Validate and commit a whole dependency-graph change in one GitHub revision."""
         tasks = list(new_tasks)
         updates = list(updates)
@@ -166,55 +177,81 @@ class GitHub:
                 seen.add(key)
                 if (expected.repo, expected.issue) != (replacement.repo, replacement.issue):
                     raise ValueError("Cannot change task issue binding")
+                if operation_id and operation_id in records[key].get("applied", []):
+                    keys.append(key)
+                    continue
                 current = Task.from_dict(records[key]["task"])
                 if current != replacement:
                     if current != expected:
-                        raise Conflict(f"Task changed: {key}")
+                        raise PlanConflict(f"Task changed: {key}")
                     records[key]["task"] = replacement.to_dict()
+                    added = True
+                if operation_id:
+                    records[key].setdefault("applied", []).append(operation_id)
                     added = True
                 keys.append(key)
             validate_tasks([Task.from_dict(r["task"]) for r in records.values()])
             if added:
-                sha = self._store(records, sha, "Apply approved SprintRelay task plan")
+                try:
+                    sha = self._store(records, sha, "Apply approved SprintRelay task plan")
+                except Conflict as exc:
+                    raise PlanConflict(str(exc)) from exc
             result = []
             for key in keys:
                 task, sha = self._ensure_issue(records, key, sha)
                 result.append(task)
             return result
 
-    @staticmethod
-    def _managed_body(task, marker):
-        criteria = task.acceptance
-        if isinstance(criteria, (list, tuple)):
-            criteria = "\n".join("- " + line for line in criteria)
-        artifacts = "\n".join("- " + item for item in task.deliverables)
-        deps = ", ".join(task.dependencies) or "—"
-        links = "\n".join("- " + item for item in task.links) or "—"
-        remaining = "unknown" if task.remaining_hours is None else f"{task.remaining_hours:g} h"
-        return (
-            f"{marker}\n**{task.key}** · {task.role} · {task.status}\n\n{task.description}"
-            f"\n\n**Acceptance**\n\n{criteria}\n\n**Deliverables**\n\n{artifacts}"
-            f"\n\n**Requirements** {', '.join(task.requirement_ids)}"
-            f"\n\n**Dependencies** {deps} · **Remaining** {remaining}"
-            f"\n\n**Evidence / PRs**\n\n{links}\n\n"
-            "Use `!relay ACTION [VALUE]` in a new issue comment to update the task."
-            "\n<!-- /sprint-relay -->"
-        )
+    def _find_issue(self, route, key, opening, closing):
+        # A lost POST may already have created the issue. A pasted or damaged
+        # marker must never bind an arbitrary issue or cause a second creation.
+        candidates = []
+        for issue in self._pages(route, {"state": "all"}):
+            if "pull_request" in issue:
+                continue
+            body = issue["body"] or ""
+            if opening in body or issue["title"].startswith(f"[{key}] "):
+                candidates.append(issue)
+        if not candidates:
+            return None
+        lines = (candidates[0]["body"] or "").splitlines()
+        if len(candidates) != 1 or opening not in lines or closing not in lines:
+            raise Conflict(f"{key}: ambiguous or damaged issue marker; inspect matching issues before retrying")
+        return candidates[0]
+
+    def _compose_body(self, task, issue, title, block, opening, closing):
+        cached = self._db.execute(
+            "SELECT title, body_hash FROM relay_issue_cache WHERE key=?", (task.key,)
+        ).fetchone()
+        body = issue["body"] or ""
+        head, start, remainder = body.partition(opening)
+        inside, end, tail = remainder.partition(closing)
+        if start and end:
+            previous = opening + inside + closing
+            body = head + block + tail
+            if previous != block and (not cached or digest(previous) != cached[1]):
+                body += "\n\n**Previous GitHub issue text**\n\n" + inside.strip()
+        else:
+            # Keep all unmatched content outside the newly rendered block.
+            original = body.replace(opening, "").replace(closing, "").strip()
+            body = block + ("\n\n" + original if original else "")
+        if issue["title"] != title and (not cached or cached[0] != issue["title"]):
+            body += "\n\n**Previous GitHub title** " + issue["title"]
+        return body
 
     def _ensure_issue(self, records, key, sha):
         record = records[key]
         task = Task.from_dict(record["task"])
         marker = f"<!-- sprint-relay:{record['nonce']} -->"
+        closing = f"<!-- /sprint-relay:{record['nonce']} -->"
         root = f"/repos/{task.repo}/issues"
-        managed = self._managed_body(task, marker)
+        title, managed = render_issue(task, record["nonce"])
         state = "closed" if task.status in {"Done", "Cancelled"} else "open"
         login = self.config.github_users.get(task.assignee)
         # A Discord-only member can claim and complete design work.
-        desired = {"title": f"[{task.key}] {task.title}", "body": managed}
+        desired = {"title": title, "body": managed}
         if task.issue is None:
-            matches = (i for i in self._pages(root, {"state": "all"})
-                       if "pull_request" not in i and marker in (i["body"] or ""))
-            issue = next(matches, None)
+            issue = self._find_issue(root, key, marker, closing)
             if issue is None:
                 issue = self.request("POST", root, {**desired, "assignees": [login] if login else []})
             task = replace(task, issue=issue["number"])
@@ -222,13 +259,9 @@ class GitHub:
             sha = self._store(records, sha, f"Bind {key} to issue {issue['number']}")
         else:
             issue = self.request("GET", f"{root}/{task.issue}")
-        body = issue["body"] or ""
-        if marker in body and "<!-- /sprint-relay -->" in body.split(marker, 1)[1]:
-            prefix, suffix = body.split(marker, 1)
-            _, tail = suffix.split("<!-- /sprint-relay -->", 1)
-            desired["body"] = prefix + managed + tail
-        elif body and marker not in body:
-            desired["body"] = managed + "\n\n" + body
+        desired["body"] = self._compose_body(task, issue, desired["title"], managed, marker, closing)
+        if len(desired["body"]) > BODY_LIMIT:
+            raise Conflict(f"{key}: shorten manual issue notes to fit GitHub's {BODY_LIMIT}-character body limit")
         desired["state"] = state
         changes = {k: v for k, v in desired.items() if issue.get(k) != v}
         if {u["login"].casefold() for u in issue.get("assignees", [])} != (
@@ -237,6 +270,9 @@ class GitHub:
             changes["assignees"] = [login] if login else []
         if changes:
             self.request("PATCH", f"{root}/{task.issue}", changes)
+        with self._db:
+            self._db.execute("INSERT OR REPLACE INTO relay_issue_cache VALUES(?,?,?)",
+                             (key, desired["title"], digest(managed)))
         if self.config.project_id:
             try:
                 self._project(task, issue["node_id"])
@@ -253,7 +289,9 @@ class GitHub:
 
     def _project(self, task, node):
         project = self.config.project_id
-        signature = digest([project, node, task.status, task.forecast_start, task.forecast_end])
+        # Refresh unchanged projections hourly to repair manually moved or removed items.
+        signature = digest([project, node, task.status, task.forecast_start, task.forecast_end,
+                            self.config.calendar.get("timezone", "Asia/Tokyo"), int(time.time()) // 3600])
         cached = self._db.execute("SELECT hash FROM relay_projection WHERE key=?", (task.key,)).fetchone()
         if cached and cached[0] == signature:
             return
@@ -268,7 +306,10 @@ class GitHub:
                ... on ProjectV2Field {id name dataType}
                }}}}}""", {"p": project},
         )
-        fields = {f["name"]: f for f in result["node"]["fields"]["nodes"] if "name" in f}
+        project_node = result.get("node")
+        if not project_node or "fields" not in project_node:
+            raise GitHubError(404, "Project is inaccessible")
+        fields = {f["name"]: f for f in project_node["fields"]["nodes"] if f and "name" in f}
         status_field = fields.get("Status", {})
         status = next((o["id"] for o in status_field.get("options", [])
                        if o["name"].casefold() == task.status.casefold()), None)
@@ -281,7 +322,11 @@ class GitHub:
         for name, date in (("Start date", task.forecast_start), ("Target date", task.forecast_end)):
             field = fields.get(name, {})
             if field.get("dataType") == "DATE":
-                values.append((field["id"], {"date": date[:10]} if date else None))
+                local_date = None
+                if date:
+                    zone = ZoneInfo(self.config.calendar.get("timezone", "Asia/Tokyo"))
+                    local_date = datetime.fromisoformat(date).astimezone(zone).date().isoformat()
+                values.append((field["id"], {"date": local_date} if local_date else None))
         for field_id, value in values:
             variables = {"p": project, "i": item, "f": field_id}
             if value is None:
@@ -406,8 +451,14 @@ class GitHub:
             records, sha = self._load()
             actors = {login.casefold(): actor for actor, login in self.config.github_users.items() if login}
             for key in sorted(records):
-                task, sha = self._ensure_issue(records, key, sha)
-                if self._comments(task, records[key]["comment"], actors):
+                try:
+                    task, sha = self._ensure_issue(records, key, sha)
+                    if self._comments(task, records[key]["comment"], actors):
+                        records, sha = self._load()
+                except (Conflict, GitHubError) as exc:
+                    if isinstance(exc, GitHubError) and exc.status not in (404, 410, 422):
+                        raise
+                    self.notify(f"sync:{key}:{exc}", f"{key}: issue reconciliation needs attention ({exc}).")
                     records, sha = self._load()
             for repo in sorted({r["task"]["repo"] for r in records.values()}):
                 try:

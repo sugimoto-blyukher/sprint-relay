@@ -175,7 +175,7 @@ class Workflow:
                 raise ValueError("Another draft was saved; reload")
             return self._save(db, row, markdown, _minutes(minutes), actor, "Initial draft")
 
-    def revise(self, meeting, actor, markdown, reason, *, based_on=None):
+    def revise(self, meeting, actor, markdown, reason, *, based_on=None, minutes=None):
         self._member(actor)
         with self.lock, private_db(self.path) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -185,7 +185,8 @@ class Workflow:
             previous = self._revision(db, row["head"])
             if previous["approved_by"] and row["published"] != row["head"]:
                 raise ValueError("Retry publication of the approved plan first")
-            return self._save(db, row, markdown, json.loads(previous["minutes"]), actor, reason)
+            records = json.loads(previous["minutes"]) if minutes is None else _minutes(minutes)
+            return self._save(db, row, markdown, records, actor, reason)
 
     def show(self, meeting, actor, *, digest=None):
         self._member(actor)
@@ -224,11 +225,15 @@ class Workflow:
                        (_json(report), str(actor), digest))
             return report
 
-    def _plan(self, markdown, data):
+    def _plan(self, markdown, data, *, initial):
         if not isinstance(data, list) or not data:
             raise ValueError("Provide a nonempty list of task definitions")
         tasks = [new_task(item, self.config) for item in data]
-        validate_tasks(tasks)
+        keys = {t.key for t in tasks}
+        existing = self.github.list_tasks()
+        if initial and any(t.key in keys for t in existing):
+            raise ValueError("A task key already belongs to another approved plan")
+        validate_tasks([t for t in existing if t.key not in keys] + tasks)
         defined = set(REQUIREMENT.findall(markdown))
         linked = {key for task in tasks for key in task.requirement_ids}
         if linked != defined:
@@ -251,12 +256,18 @@ class Workflow:
                 else:
                     if tasks is None:
                         tasks = self._ai(row).tasks(rev["markdown"], digest)
-                    plan = self._plan(rev["markdown"], tasks)
+                    plan = self._plan(rev["markdown"], tasks, initial=row["published"] is None)
                 if row["published"] == digest:
                     keys = {task.key for task in plan}
+                    if self.changes:
+                        keys = self.changes.published_keys(digest, keys)
                     return [task for task in self.github.list_tasks() if task.key in keys]
                 if row["published"] and self.changes is None:
                     raise ValueError("Change manager required to reconcile an approved specification")
+                old = self._revision(db, row["published"]) if row["published"] else None
+                if old and not rev["plan"]:
+                    previous = [Task.from_dict(item) for item in json.loads(old["plan"])]
+                    self.changes.preview(meeting, digest, previous, plan)
                 db.execute("BEGIN IMMEDIATE")
                 current = self._revision(db, digest)
                 if self._meeting(db, meeting)["head"] != digest or current["report"] != rev["report"]:
@@ -266,7 +277,6 @@ class Workflow:
                 else:
                     db.execute("UPDATE revision SET approved_by=?, plan=? WHERE digest=?",
                                (str(actor), _json([task.to_dict() for task in plan]), digest))
-                old = self._revision(db, row["published"]) if row["published"] else None
 
             # Persist the exact approved plan before making any network calls. A retry
             # uses these bytes even if a provider would produce different task keys.

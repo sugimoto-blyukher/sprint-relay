@@ -122,3 +122,19 @@ def test_private_import_is_idempotent_and_consent_enforced(flow):
     with pytest.raises(PermissionError):
         flow.show(meeting, "outsider")
     assert flow.path.stat().st_mode & 0o077 == 0
+
+
+@pytest.mark.parametrize("stage", ["initial", "revised"])
+@pytest.mark.parametrize("oversized", [{"title": "X" * 255}, {"description": "<!--" * 14_000}])
+def test_oversized_issue_preflight_keeps_approval_editable(flow, stage, oversized):
+    meeting, digest = revised(flow)
+    flow.validate(meeting, "33", digest, report=report(digest))
+    if stage == "revised":
+        flow.approve(meeting, "33", digest, tasks=[proposal()])
+        digest = flow.revise(meeting, "22", SPEC + "Support UTF-8.", "Change scope")
+        flow.validate(meeting, "33", digest, report=report(digest))
+    previous_archives = dict(flow.github.archived)
+    with pytest.raises(ValueError, match="rendered GitHub issue"):
+        flow.approve(meeting, "33", digest, tasks=[{**proposal(), **oversized}])
+    assert flow.show(meeting, "22")["approved_by"] is None
+    assert flow.github.archived == previous_archives
