@@ -1,0 +1,1 @@
+"""SprintRelay hackathon coordination service."""
