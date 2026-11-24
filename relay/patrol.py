@@ -464,8 +464,8 @@ class Patrol:
 
     def priority(self, patrol_id, job_id, finding_id, task_id, expected_version, priority, reason=None,
                  *, provider, check, db=None):
-        if type(priority) is not int or not 0 <= priority <= 5:
-            raise ValueError("Priority must be 0 through 5")
+        if type(priority) is not int or not -100 <= priority <= 100:
+            raise ValueError("Priority must be -100 through 100")
         with self._db(db) as conn:
             assigned, _ = self._finding(conn, job_id, finding_id, provider)
             records, sha = self.github._load()
@@ -491,7 +491,7 @@ class Patrol:
             return {"receipt": key, "status": "applied", "repo": task.repo, "number": task.issue}
 
     def report(self, patrol_id, summary, references, *, provider, check, db=None):
-        bounded(summary, "patrol summary", 1800)
+        bounded(summary, "patrol summary", 2048)
         if not isinstance(references, list) or len(references) > 50:
             raise ValueError("Invalid patrol references")
         with self._db(db) as conn:

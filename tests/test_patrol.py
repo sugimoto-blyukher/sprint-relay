@@ -283,3 +283,44 @@ def test_cli_snapshot_is_scoped_to_the_leased_product_audit(rig, monkeypatch):
     assert fences == [False, True]
     assert mounted["sha"] == HEAD and set(mounted["evidence"][0]) == {"id", "path", "text"}
     assert not any(raw in str(mounted) for raw in ("token=fixture", "do not share"))
+
+
+def test_gateway_routes_real_patrol_and_audit_with_separate_leases(rig):
+    from relay.gateway import Gateway
+    from relay.jobs import JobStore
+    from relay.security import Principal
+    from relay.settings import AgentSettings, PrivacySettings
+
+    p, api = rig
+    c = p.config
+    c.privacy = PrivacySettings(project_providers=("muse", "codex"))
+    c.agents["muse"] = AgentSettings(enabled=True, verified=True, terms_confirmed=True, schedule_confirmed=True)
+    c.agents["codex"] = AgentSettings(enabled=True, verified=False, terms_confirmed=True)
+    store = p.jobs = JobStore(p.path, c)
+    gw = Gateway(p.project, c, store, None, p, None, p.github)
+    store.maintenance(p.project)
+    probe = store.list_jobs(p.project, role="audit", provider="codex", kinds=["probe"])[0]
+    proof = store.claim(probe["id"], "codex")
+    store.complete(probe["id"], "codex", proof["lease_token"], {"challenge": proof["payload"]["challenge"]})
+    c.agents["codex"] = c.agents["codex"].model_copy(update={"verified": True})
+    slot = store.patrol(p.project)
+    token = store.claim(slot, "muse")["lease_token"]
+    manager = Principal("fixture", "muse", "management", p.project, slot, token)
+
+    def call(name, principal=manager, **args):
+        return gw.dispatch(name, principal, {"project_id": p.project, "job_id": principal.job_id,
+                                             "lease_token": principal.lease_token, **args})
+    delta = call("get_patrol_delta")
+    audit_id = call("request_audit", kind="pr", repo="owner/product", target="8", sha=HEAD,
+                    question="Check regression coverage")["job_id"]
+    audit_token = store.claim(audit_id, "codex")["lease_token"]
+    auditor = Principal("fixture-worker", "codex", "audit", p.project, audit_id, audit_token)
+    ctx = call("get_audit_context", auditor)
+    finding = {"category": "test_coverage", "severity": "medium", "evidence_id": ctx["evidence"][0]["id"],
+               "summary": "Fixture coverage", "impact": "Unexpected result", "acceptance": "Add a regression"}
+    result = call("submit_audit_result", auditor, findings=[finding])
+    args = dict(audit_id=audit_id, finding_id=result["findings"][0]["finding_id"])
+    assert call("propose_or_create_issue", **args)["number"] == 1
+    assert call("post_review_comment", **args)["number"] == 77
+    assert call("publish_patrol_report", summary="Summary", references=[delta["changes"][0]["id"]])["status"] == "queued"
+    assert call("complete_patrol", snapshot_cursor=delta["snapshot_cursor"])["checkpoint"] == delta["snapshot_cursor"]
