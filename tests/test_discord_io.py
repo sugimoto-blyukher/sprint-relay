@@ -21,8 +21,8 @@ class DiscordIOTests(unittest.TestCase):
             authorize(config, interaction, "meetings")
 
     def test_oversize_attachment_fails_before_download(self):
-        attachment = NS(filename="sample.txt", size=300000)
-        with self.assertRaisesRegex(ValueError, "128 KiB"):
+        attachment = NS(filename="sample.txt", size=2 * 1024 * 1024)
+        with self.assertRaisesRegex(ValueError, "1048576-byte"):
             asyncio.run(read_text(attachment))
 
     def test_batches_preserve_ids_under_limit(self):

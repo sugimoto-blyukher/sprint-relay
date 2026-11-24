@@ -1,10 +1,10 @@
-# Working on SprintRelay
+# SprintRelay development
 
-Read sprint-relay-implementation.md before changing workflow semantics. Keep one Linux service and GitHub as the canonical task/spec store. Put member, repository, period and channel choices in config.
+Read [the v2 specification](sprint-relay-v2-specification.md) before changing workflow semantics. It supersedes the original brief. The operational agents use the documented MCP contracts. Only a development checkout is used for changes to SprintRelay itself.
 
-- Run `python -m pip install -e '.[test]'`, `python -m relay check --config config.example.toml` and `python -m pytest -q`. Mock external transports and use fictional fixtures.
-- Keep deterministic work in relay/core.py and relay/schedule.py. Authorization, task transitions and calendar decisions must remain independent of model output.
-- Preserve human edits, the exact reviewed revision, approval receipts, issue bindings, baselines and actuals on retries and scope changes. Validate the complete DAG before publishing.
-- Use the configured private location for meeting data. Keep secrets, transcripts, the service database and production configuration out of commits and logs.
-- Keep the Discord and GitHub paths on the same state transition code. Review new external permissions and document setup/fallbacks in docs/integrations.md.
-- Submit reviewable changes via a pull request. Test failed and retried operations whenever changing publication or synchronization.
+- Install `python -m pip install -e '.[test]'`, then run `python -m relay check --config config.example.toml`, `python -m relay migrate --dry-run --config config.example.toml` and `python -m pytest -q`.
+- Keep one Core and one private state directory. GitHub continues to own published task/spec state. Preserve stable issue bindings, human edits, approval receipts, baselines, deadlines and actuals across migration and retries.
+- Exercise MCP tools through the authorized role and project. Verify consent, expiry, job and fence at the mutation boundary. Keep the same idempotency key across providers and recovery. A successful CLI exit requires an independently validated MCP result.
+- Run scheduling, counts, actor checks and approvals in application code. Keep agent job credentials scoped and ephemeral. Operational workers never inherit Core credentials or get a product checkout, shell tools or code-writing capability.
+- Keep provider integration within official account-authenticated clients. Record exact live smoke results separately from synthetic tests. Preserve the default disabled/unverified policy for optional clients. Use only fictional transcripts, diffs, CI output and issue text in tests.
+- Submit changes and the test results for review in a pull request. Maintain the operating instructions when changing a permission boundary or configuration field.

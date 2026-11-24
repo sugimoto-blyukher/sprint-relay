@@ -28,13 +28,14 @@ class BotTests(unittest.TestCase):
         self.config = load_config(CONFIG)
         self.github = Mock()
         self.workflow = Mock()
+        self.workflow.show.return_value = {"state": "IMPORTED", "job_id": "j-test"}
         self.tasks = [Task("A", "A", "A", "backend", 2, 2, assignee="10104")]
         self.github.tasks.side_effect = lambda: self.tasks.copy()
         def publish_changes(new, changes):
             for expected, task in changes:
                 self.tasks[self.tasks.index(expected)] = task
         self.github.publish_changes.side_effect = publish_changes
-        self.service = Service(self.config, self.github, self.workflow, None, Path(self.dir.name) / "cache.db")
+        self.service = Service(self.config, self.github, self.workflow, Mock(), Path(self.dir.name) / "cache.db")
 
     def test_calendar_update_persists_and_stable_schedule_skips_writes(self):
         initial = self.service.recalculate()
@@ -67,7 +68,7 @@ class BotTests(unittest.TestCase):
             guild = discord.Object(id=int(self.config.guild_id))
             tree = client.command_tree
             self.assertEqual({c.name for c in tree.get_commands(guild=guild)},
-                             {"meeting", "Import transcript", "spec", "task", "schedule", "progress", "scope"})
+                             {"meeting", "Import transcript", "spec", "task", "schedule", "progress", "scope", "relay"})
             ctx = NS(user=NS(id=10104), guild_id=guild.id, channel_id=11112, id=77,
                      guild=NS(default_role=1), response=NS(defer=AsyncMock()),
                      followup=NS(send=AsyncMock()))
@@ -82,23 +83,42 @@ class BotTests(unittest.TestCase):
             ctx.channel_id = 11111
             ctx.channel = NS(permissions_for=lambda role: NS(view_channel=False))
             await cmd.callback(ctx, text="fictional")
-            self.workflow.import_meeting.assert_called_once_with("discord:10000/11111/77", "fictional", "10104", False)
+            self.workflow.import_meeting.assert_called_once_with("discord:10000/11111/77", "fictional", "10104", False, providers=[], attachment_hash=None)
             await client.close()
         asyncio.run(run())
 
-    def test_attachment_summary_opt_in_is_approver_only(self):
+    def test_pause_requires_approver_and_degraded_progress_still_works(self):
         async def run():
-            self.service.provider = Mock()
-            self.service.provider.summary.return_value = "aggregate"
             client = create_client(self.service, worker=self.worker)
             guild = discord.Object(id=int(self.config.guild_id))
-            command = client.command_tree.get_command("progress", guild=guild)
+            members = client.command_tree.get_command("relay", guild=guild)
             ctx = NS(user=NS(id=10104), guild_id=guild.id, channel_id=11112,
                      response=NS(defer=AsyncMock()), followup=NS(send=AsyncMock()))
-            await command.callback(ctx, ai_consent=True)
-            self.service.provider.summary.assert_not_called()
+            await members.get_command("pause").callback(ctx)
+            self.service.control.pause.assert_not_called()
             ctx.user.id = 10101
-            await command.callback(ctx, ai_consent=True)
-            self.assertEqual(json.loads(self.service.provider.summary.call_args.args[0]), {"status_counts": {"Todo": 1}})
+            await members.get_command("pause").callback(ctx)
+            self.service.control.pause.assert_called_once_with("10101")
+            command = client.command_tree.get_command("progress", guild=guild)
+            await command.callback(ctx)
+            self.assertIn("Todo", ctx.followup.send.call_args.args[0])
+            self.assertFalse(self.workflow.mock_calls)
+            await client.close()
+        asyncio.run(run())
+
+    def test_transcript_permission_is_destination_specific(self):
+        async def run():
+            client = create_client(self.service, worker=self.worker)
+            guild = discord.Object(id=int(self.config.guild_id))
+            cmd = client.command_tree.get_command("meeting", guild=guild).get_command("import")
+            ctx = NS(user=NS(id=10104), guild_id=guild.id, channel_id=11111, id=77,
+                     guild=NS(default_role=1), channel=NS(permissions_for=lambda role: NS(view_channel=False)),
+                     response=NS(defer=AsyncMock()), followup=NS(send=AsyncMock()))
+            await cmd.callback(ctx, text="fictional", consent=True)
+            await cmd.callback(ctx, text="fictional", providers="codex")
+            self.workflow.import_meeting.assert_not_called()
+            await cmd.callback(ctx, text="fictional", consent=True, providers="muse, codex")
+            self.assertEqual(self.workflow.import_meeting.call_args.kwargs["providers"], ["muse", "codex"])
+            self.assertIn("j-test", ctx.followup.send.call_args.args[0])
             await client.close()
         asyncio.run(run())

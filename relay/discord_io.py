@@ -1,12 +1,16 @@
 """Discord transport validation shared by commands and interactive controls."""
 
-MAX_INPUT_BYTES = 128 * 1024
+from hashlib import sha256
+
+
+MAX_INPUT_BYTES = 1024 * 1024
 
 
 def authorize(config, interaction, channel, *, approver=False):
     actor = str(interaction.user.id)
     if (
-        str(interaction.guild_id) != config.guild_id
+        getattr(interaction.user, "bot", False) is True
+        or str(interaction.guild_id) != config.guild_id
         or str(interaction.channel_id) != config.channels[channel]
         or actor not in set(config.members) | set(config.approvers)
     ):
@@ -20,18 +24,23 @@ def authorize(config, interaction, channel, *, approver=False):
     return actor
 
 
-async def read_text(attachment, *, extensions=(".md", ".txt")):
+async def read_attachment(attachment, *, extensions=(".md", ".txt"), limit=MAX_INPUT_BYTES):
     if not attachment.filename.lower().endswith(extensions):
         raise ValueError(f"Upload a {' or '.join(extensions)} file.")
-    if attachment.size > MAX_INPUT_BYTES:
-        raise ValueError("The input exceeds 128 KiB.")
+    if attachment.size > limit:
+        raise ValueError(f"The input exceeds the configured {limit}-byte limit.")
     content = await attachment.read()
-    if len(content) > MAX_INPUT_BYTES:
-        raise ValueError("The input exceeds 128 KiB.")
+    if len(content) > limit:
+        raise ValueError(f"The input exceeds the configured {limit}-byte limit.")
     try:
-        return content.decode("utf-8-sig")
+        return content.decode("utf-8-sig"), sha256(content).hexdigest()
     except UnicodeDecodeError as exc:
         raise ValueError("The file must contain UTF-8 text.") from exc
+
+
+async def read_text(attachment, *, extensions=(".md", ".txt"), limit=MAX_INPUT_BYTES):
+    text, _ = await read_attachment(attachment, extensions=extensions, limit=limit)
+    return text
 
 
 def notice_batches(notices):

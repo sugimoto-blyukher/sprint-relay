@@ -1,0 +1,13 @@
+[Unit]
+Description=SprintRelay %i CLI gateway socket
+
+[Socket]
+ListenStream=/run/sprintrelay-workers/%i.sock
+SocketUser=root
+SocketGroup=sprintrelay
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

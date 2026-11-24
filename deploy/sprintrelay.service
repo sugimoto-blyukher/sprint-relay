@@ -1,0 +1,29 @@
+[Unit]
+Description=SprintRelay Core (Discord, MCP, scheduler)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=sprintrelay
+Group=sprintrelay
+WorkingDirectory=/opt/sprintrelay
+EnvironmentFile=/etc/sprintrelay/core.env
+ExecStart=/opt/sprintrelay/.venv/bin/python -m relay run --config /etc/sprintrelay/config.toml --state-dir /var/lib/sprintrelay
+StateDirectory=sprintrelay
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
