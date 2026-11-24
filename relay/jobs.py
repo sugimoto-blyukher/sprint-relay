@@ -13,6 +13,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+MAX_INPUT_CORRECTIONS = 2
+
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS jobs (
         id TEXT PRIMARY KEY, project TEXT NOT NULL, kind TEXT NOT NULL, role TEXT NOT NULL,
@@ -28,6 +30,8 @@ SCHEMA = (
     """CREATE TABLE IF NOT EXISTS job_attempts(
         job_id TEXT REFERENCES jobs(id), generation INTEGER, provider TEXT NOT NULL, started REAL NOT NULL,
         finished REAL, outcome TEXT, PRIMARY KEY(job_id,generation))""",
+    """CREATE TABLE IF NOT EXISTS job_input_errors(
+        job_id TEXT PRIMARY KEY REFERENCES jobs(id), failures INTEGER NOT NULL)""",
     """CREATE TABLE IF NOT EXISTS artifacts(
         id TEXT PRIMARY KEY, project TEXT NOT NULL, kind TEXT NOT NULL, digest TEXT NOT NULL, data TEXT NOT NULL,
         created REAL NOT NULL)""",
@@ -372,6 +376,18 @@ class JobStore:
             if row["data"] == "null":
                 raise ValueError("Artifact contents expired under the retention policy")
             return json.loads(row["data"])
+
+    def input_error(self, job_id, provider, token):
+        """Count correctable rejections across tools, reconnects and attempts for this job."""
+        with self.transaction() as db:
+            job = self.require_lease(job_id, provider, token, db=db)
+            db.execute("""INSERT INTO job_input_errors VALUES(?,1)
+                          ON CONFLICT(job_id) DO UPDATE SET failures=failures+1""", (job_id,))
+            failures = db.execute("SELECT failures FROM job_input_errors WHERE job_id=?", (job_id,)).fetchone()[0]
+            if failures > MAX_INPUT_CORRECTIONS:
+                self._failure(db, job, "INPUT")
+                return 0
+            return MAX_INPUT_CORRECTIONS + 1 - failures
 
     def fail(self, job_id, provider, token, error, *, retry_after=None):
         with self.transaction() as db:

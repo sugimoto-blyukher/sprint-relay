@@ -18,7 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .mcp_contracts import ALLOWED, T, TOOL_DESCRIPTIONS, Lease, Project
+from .mcp_contracts import ALLOWED, T, TOOL_DESCRIPTIONS, input_model
 from .security import OAuthVerifier, TokenVault
 from .probe_diagnostics import emit
 
@@ -31,9 +31,9 @@ WIRE_CODES = {"initialize": "MCP_INITIALIZE", "tools/list": "MCP_TOOLS_LIST"}
 CALL_CODES = {"get_project_context": "MCP_GET_PROJECT_CONTEXT", "heartbeat_job": "MCP_HEARTBEAT_JOB"}
 
 
-def _diagnostic(principal, code, *, status=None, tool_count=None, tool=None):
+def _diagnostic(principal, code, *, status=None, tool_count=None, tool=None, field=None, reason=None):
     emit(code, enabled=principal.diagnose, job_id=principal.job_id, provider=principal.provider,
-         role=principal.role, status=status, tool_count=tool_count, tool=tool, probe=principal.synthetic_probe)
+         role=principal.role, status=status, tool_count=tool_count, tool=tool, probe=principal.synthetic_probe, field=field, reason=reason)
 
 
 class _ProbeJSON:
@@ -100,21 +100,28 @@ async def _observe_probe(transport, principal, scope, receive, send):
 class BoundaryError(Exception):
     """Only fixed, non-sensitive codes cross the MCP error boundary."""
 
-    def __init__(self, code):
+    def __init__(self, code, *, field=None, reason=None, remaining=None):
         super().__init__(code)
         self.code = code
+        self.field, self.reason, self.remaining = field, reason, remaining
 
 
-def _result(code):
+def _result(code, *, error=None):
     errors = {"UNAUTHORIZED": "This identity lacks the requested capability.",
               "LEASE_LOST": "The assigned lease is no longer valid.",
               "STALE_REVISION": "The requested revision has changed.",
               "CONFLICT": "Refresh the current state before continuing.",
               "INVALID_INPUT": "Check the tool schema and references.",
+              "INPUT_REJECTED": "The assigned input requires operator review.",
+              "INPUT_LIMIT": "Input correction limit reached. This job has stopped.",
               "UNAVAILABLE": "The dependent service is unavailable.",
               "BLOCKING_FINDINGS": "Human review is required.",
               "RETRYABLE": "The dependency may be retried."}
     data = {"code": code, "message": errors.get(code, "Request rejected.")}
+    if error and error.reason:
+        data.update(field=error.field, reason=error.reason)
+        if error.remaining is not None:
+            data["remaining_submissions"] = error.remaining
     return types.CallToolResult(isError=True, structuredContent=data,
                                 content=[types.TextContent(type="text", text=json.dumps(data))])
 
@@ -143,11 +150,9 @@ def create_app(gateway, *, local_tokens: TokenVault | None = None, oauth: OAuthV
         descriptions = PROBE_DESCRIPTIONS if principal.synthetic_probe else TOOL_DESCRIPTIONS
         if not principal.synthetic_probe:
             _diagnostic(principal, "MCP_CATALOG_READY", tool_count=len(names))
-        inputs = {}
-        if principal.provider == "codex" and not principal.synthetic_probe:
-            inputs = {"get_project_context": Project, "heartbeat_job": Lease}
+        codex_job = principal.provider == "codex" and not principal.synthetic_probe
         return [types.Tool(name=name, description=descriptions[name],
-                           inputSchema=inputs.get(name, T[name][0]).model_json_schema(),
+                           inputSchema=input_model(name, codex_job=codex_job).model_json_schema(),
                            outputSchema=T[name][1].model_json_schema())
                 for name in sorted(names)]
 
@@ -162,14 +167,11 @@ def create_app(gateway, *, local_tokens: TokenVault | None = None, oauth: OAuthV
                                         content=[types.TextContent(type="text", text=json.dumps(output, ensure_ascii=False))])
         except BoundaryError as exc:
             _diagnostic(principal, "MCP_TOOL_FAILED", tool=name)
-            _diagnostic(principal, "MCP_TOOL_" + exc.code, tool=name)
-            return _result(exc.code)
+            _diagnostic(principal, "MCP_TOOL_" + exc.code, tool=name, field=exc.field, reason=exc.reason)
+            return _result(exc.code, error=exc)
         except PermissionError:
             _diagnostic(principal, "MCP_TOOL_FAILED", tool=name)
             return _result("UNAUTHORIZED")
-        except (ValueError, KeyError, TypeError, OverflowError):
-            _diagnostic(principal, "MCP_TOOL_FAILED", tool=name)
-            return _result("INVALID_INPUT")
         except Exception:
             # External service exceptions or validation errors can include inputs.
             _diagnostic(principal, "MCP_TOOL_FAILED", tool=name)

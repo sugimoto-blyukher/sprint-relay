@@ -322,5 +322,13 @@ def test_gateway_routes_real_patrol_and_audit_with_separate_leases(rig):
     args = dict(audit_id=audit_id, finding_id=result["findings"][0]["finding_id"])
     assert call("propose_or_create_issue", **args)["number"] == 1
     assert call("post_review_comment", **args)["number"] == 77
+    from relay.mcp_server import BoundaryError
+    with pytest.raises(BoundaryError) as caught:
+        call("publish_patrol_report", summary="Summary", references=[delta["snapshot_cursor"]])
+    assert (caught.value.code, caught.value.field, caught.value.reason) == (
+        "INVALID_INPUT", "references", "UNKNOWN_REFERENCE")
+    assert store.get(slot)["state"] == "RUNNING" and store.checkpoint(p.project) is None
+    with store.transaction(write=False) as conn:
+        assert not conn.execute("SELECT 1 FROM artifacts WHERE id=?", ("patrol:" + slot,)).fetchone()
     assert call("publish_patrol_report", summary="Summary", references=[delta["changes"][0]["id"]])["status"] == "queued"
     assert call("complete_patrol", snapshot_cursor=delta["snapshot_cursor"])["checkpoint"] == delta["snapshot_cursor"]

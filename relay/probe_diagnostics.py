@@ -2,7 +2,7 @@
 import logging
 import re
 
-from .mcp_contracts import T
+from .mcp_contracts import INPUT_REASONS, T
 
 
 log = logging.getLogger("relay.probe")
@@ -20,12 +20,12 @@ CODES = frozenset("""
     CLI_JSON_UNREADABLE CLI_JSON_TRUNCATED CODE_MODE_HOST_UNAVAILABLE
     AUDIT_SNAPSHOT_DENIED AUDIT_SNAPSHOT_INVALID AUDIT_SNAPSHOT_DEPENDENCY_FAILED
     PROBE_COMPLETED JOB_COMPLETED MCP_CATALOG_READY MCP_TOOL_UNAUTHORIZED MCP_TOOL_LEASE_LOST
-    MCP_TOOL_INVALID_INPUT MCP_TOOL_STALE_REVISION MCP_TOOL_CONFLICT MCP_TOOL_RETRYABLE MCP_TOOL_BLOCKING_FINDINGS
+    MCP_TOOL_INPUT_LIMIT MCP_TOOL_INPUT_REJECTED MCP_TOOL_INVALID_INPUT MCP_TOOL_STALE_REVISION MCP_TOOL_CONFLICT MCP_TOOL_RETRYABLE MCP_TOOL_BLOCKING_FINDINGS
 """.split())
 
 
 def emit(code, *, enabled, job_id=None, provider=None, role=None, status=None, exit_code=None,
-         tool_count=None, tool=None, probe=True):
+         tool_count=None, tool=None, probe=True, field=None, reason=None):
     if not enabled or code not in CODES:
         return
     job = job_id if isinstance(job_id, str) and re.fullmatch(r"[0-9a-f]{32}", job_id) else "-"
@@ -35,6 +35,10 @@ def emit(code, *, enabled, job_id=None, provider=None, role=None, status=None, e
     rc = exit_code if type(exit_code) is int and -255 <= exit_code <= 255 else "-"
     count = tool_count if type(tool_count) is int and 0 <= tool_count <= 1000 else "-"
     safe_tool = tool if isinstance(tool, str) and tool in T else "-"
+    detail = ""
+    if reason in INPUT_REASONS and safe_tool in T:
+        safe_field = field if field in T[safe_tool][0].model_fields else "arguments"
+        detail = f" field={safe_field} reason={reason}"
     label = "mcp" if code == "MCP_AUTH_REJECTED" else "probe" if probe else "job"
-    log.warning("%s code=%s job=%s provider=%s role=%s http=%s exit=%s tools=%s tool=%s",
-                label, code, job, name, kind, http, rc, count, safe_tool)
+    log.warning("%s code=%s job=%s provider=%s role=%s http=%s exit=%s tools=%s tool=%s%s",
+                label, code, job, name, kind, http, rc, count, safe_tool, detail)

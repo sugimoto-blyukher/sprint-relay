@@ -19,7 +19,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .mcp_contracts import codex_tools
+from .mcp_contracts import REPORT_REFERENCES, codex_tools
 from .probe_diagnostics import emit
 
 SOCKET_DIR = Path("/run/sprintrelay-workers")
@@ -33,7 +33,9 @@ MANAGEMENT = (
     "Process only the assigned import, reviewed revision, approved task plan, or patrol. Separate "
     "proposals from decisions and cite source positions. Preserve human edits and stable requirement "
     "IDs. Submit the result using the corresponding MCP tool and the exact revision. For patrols "
-    "process each delta page and outstanding risks, publish the report, then complete the checkpoint. "
+    f"process each delta page and outstanding risks. {REPORT_REFERENCES} "
+    "Publish the report, then complete the checkpoint. "
+    "On INVALID_INPUT, correct the indicated argument within the remaining submission budget. "
     "Request audits asynchronously; release the current job without waiting for an audit. "
     "Leave scope, dates, owners, approval and completion decisions to humans."
 )

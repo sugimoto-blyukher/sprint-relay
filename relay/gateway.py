@@ -7,7 +7,7 @@ from hmac import compare_digest
 from pydantic import ValidationError
 
 from .github import Conflict, GitHubError, digest
-from .mcp_contracts import ALLOWED, PROBE_TOOLS, T, codex_tools
+from .mcp_contracts import ALLOWED, PROBE_TOOLS, T, InputProblem, Lease, codex_tools, input_model
 from .mcp_server import BoundaryError
 from .schedule import recalculate
 
@@ -94,7 +94,8 @@ class Gateway:
             return validated
         except BoundaryError as exc:
             outcome = {"UNAUTHORIZED": "denied", "LEASE_LOST": "stale", "STALE_REVISION": "stale",
-                       "CONFLICT": "conflict", "INVALID_INPUT": "invalid", "RETRYABLE": "retry",
+                       "CONFLICT": "conflict", "INPUT_LIMIT": "invalid", "INPUT_REJECTED": "invalid",
+                       "INVALID_INPUT": "invalid", "RETRYABLE": "retry",
                        "BLOCKING_FINDINGS": "conflict"}.get(exc.code, "failed")
             raise
         finally:
@@ -102,11 +103,12 @@ class Gateway:
                             outcome, target=target)
 
     def _dispatch(self, name, p, args):
+        owned = None
+        token = None
         try:
             if p.project != self.project or name not in ALLOWED.get(p.role, ()):
                 raise BoundaryError("UNAUTHORIZED")
-            a = T[name][0].model_validate(args).model_dump(exclude_none=True)
-            if a["project_id"] != self.project:
+            if "project_id" in args and args["project_id"] != self.project:
                 raise BoundaryError("UNAUTHORIZED")
             bound = None
             if p.job_id:
@@ -116,7 +118,8 @@ class Gateway:
                 bound = self._lease(p, p.job_id, p.lease_token)
                 if p.provider == "codex" and name not in _codex_catalog(bound):
                     raise BoundaryError("UNAUTHORIZED")
-                if a.get("job_id", p.job_id) != p.job_id:
+                owned, token = bound, p.lease_token
+                if args.get("job_id", p.job_id) != p.job_id:
                     raise BoundaryError("UNAUTHORIZED")
             elif p.provider != "muse" or p.role != "management":
                 raise BoundaryError("UNAUTHORIZED")
@@ -136,12 +139,29 @@ class Gateway:
                 if name in {"get_tasks", "get_schedule", "get_progress"}:
                     raise BoundaryError("UNAUTHORIZED")
                 if name in {"get_audit_status", "get_audit_result"}:
-                    target = self._job(p, a["audit_id"], audit_reference=True)["payload"]
-                    if (bound["kind"] != "validation" or target.get("kind") != "spec" or
-                            target.get("meeting") != bound["payload"].get("meeting") or
-                            target.get("sha") != bound["payload"].get("digest")):
+                    if bound["kind"] != "validation":
                         raise BoundaryError("UNAUTHORIZED")
-            result = self._route(name, p, a, bound)
+                    if isinstance(args.get("audit_id"), str):
+                        target = self._job(p, args["audit_id"], audit_reference=True)["payload"]
+                        if (target.get("kind") != "spec" or target.get("meeting") != bound["payload"].get("meeting")
+                                or target.get("sha") != bound["payload"].get("digest")):
+                            raise BoundaryError("UNAUTHORIZED")
+            model = input_model(name, codex_job=p.provider == "codex" and bound is not None and not synthetic)
+            if issubclass(model, Lease):
+                # An invalid payload must never disguise a foreign job or spend another lease's budget.
+                job_id, token = args.get("job_id"), args.get("lease_token")
+                if not isinstance(job_id, str) or not isinstance(token, str):
+                    raise BoundaryError("LEASE_LOST")
+                if not bound:
+                    self._job(p, job_id)
+                owned = self._lease(p, job_id, token)
+                if name in WORK and owned["kind"] not in WORK[name]:
+                    raise BoundaryError("UNAUTHORIZED")
+            try:
+                a = model.model_validate(args).model_dump(exclude_none=True)
+            except ValidationError as exc:
+                raise InputProblem.from_validation(model, exc) from None
+            result = self._route(name, p, a, bound, owned)
             if name.startswith("get_") or name == "list_workflow_jobs":
                 # Network-backed reads can outlive their original lease check.
                 if bound:
@@ -160,22 +180,32 @@ class Gateway:
             raise BoundaryError("UNAUTHORIZED") from None
         except Conflict:
             raise BoundaryError("CONFLICT") from None
+        except InputProblem as exc:
+            remaining = None
+            if owned:
+                try:
+                    remaining = self.jobs.input_error(owned["id"], p.provider, token)
+                except PermissionError:
+                    raise BoundaryError("LEASE_LOST") from None
+            raise BoundaryError("INPUT_LIMIT" if remaining == 0 else "INVALID_INPUT",
+                                field=exc.field, reason=exc.reason, remaining=remaining) from None
         except ValidationError:
             self.reject(p, args, "INPUT")
-            raise BoundaryError("INVALID_INPUT") from None
+            raise BoundaryError("INPUT_REJECTED") from None
         except GitHubError:
             raise BoundaryError("RETRYABLE") from None
         except (ValueError, KeyError) as exc:
             # Closed codes and no original exception text: records may contain
             # private meeting data, code, or validation errors including input.
-            message = str(exc).lower()
-            if "stale" in message or "superseded" in message:
+            message = str(exc)
+            if message in {"Stale patrol slot", "Superseded workflow job", "Operation requires the current revision"}:
                 raise BoundaryError("STALE_REVISION") from None
-            if "blocking" in message:
+            if message == "Resolve blocking questions and validate before approval":
                 raise BoundaryError("BLOCKING_FINDINGS") from None
-            raise BoundaryError("INVALID_INPUT") from None
+            self.reject(p, args, "INPUT")
+            raise BoundaryError("INPUT_REJECTED") from None
 
-    def _route(self, name, p, a, bound):
+    def _route(self, name, p, a, bound, job):
         if name == "get_project_context":
             result = {"project_id": self.project, "roles": ["design", "frontend", "backend", "hardware"],
                       "constraints": ["Use only assigned data", "Human approval is required",
@@ -229,14 +259,10 @@ class Gateway:
             return {"job_id": job["id"], "state": job["state"], "created_at": job["created"],
                     "finished_at": job["finished"]}
         id, token = a["job_id"], a["lease_token"]
-        self._job(p, id)
-        job = self._lease(p, id, token)
-        if name in WORK and job["kind"] not in WORK[name]:
-            raise BoundaryError("UNAUTHORIZED")
         if name == "heartbeat_job":
             if "probe_answer" in a:
                 if job["kind"] != "probe" or not compare_digest(a["probe_answer"], job["payload"]["challenge"][::-1]):
-                    raise ValueError("Invalid proof")
+                    raise InputProblem("probe_answer", "VALUE")
                 self.jobs.complete(id, p.provider, token, {"challenge": job["payload"]["challenge"]})
                 return {"deadline": None, "completed": True}
             return {"deadline": self.jobs.heartbeat(id, p.provider, token), "completed": False}
