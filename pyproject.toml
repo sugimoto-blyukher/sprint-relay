@@ -4,16 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sprint-relay"
-version = "0.1.0"
+version = "2.0.0"
 description = "Coordinate a small hackathon team through Discord and GitHub"
 requires-python = ">=3.11"
-dependencies = ["discord.py>=2.4,<3", "Pillow>=10", "pydantic>=2,<3"]
+dependencies = ["discord.py>=2.4,<3", "Pillow>=10", "pydantic>=2.11,<3", "mcp>=1.29,<2", "PyJWT[crypto]>=2.10,<3", "uvicorn>=0.31,<1"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
 
-[tool.setuptools]
-packages = ["relay"]
+[tool.setuptools.packages.find]
+include = ["relay", "relay.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
