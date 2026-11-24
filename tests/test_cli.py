@@ -145,6 +145,7 @@ def test_core_uses_same_database_and_separate_mcp_listeners(tmp_path, monkeypatc
     async def close():
         pass
 
+    cfg.jobs = cfg.jobs.model_copy(update={"job_diagnostics": True})
     issued = []
     from unittest.mock import create_autospec
     from relay.worker import run_cli
@@ -152,11 +153,13 @@ def test_core_uses_same_database_and_separate_mcp_listeners(tmp_path, monkeypatc
     async def isolated_launch(provider, **kwargs):
         issued.append(kwargs["token"])
         identity = boundaries[0][1]["local_tokens"].verify(issued[-1])
-        assert identity.project == cfg.management_repo and identity.job_id == "probe-1"
+        assert identity.project == cfg.management_repo and identity.job_id == kwargs["job_id"]
         assert identity.lease_token == "fixture-lease" and identity.role == "audit"
         assert provider == "codex" and kwargs["snapshot"] is None
-        assert identity.synthetic_probe and kwargs["probe"] is True
-        assert not identity.diagnose and kwargs["diagnose"] is False
+        is_probe = kwargs["kind"] == "probe"
+        assert identity.synthetic_probe == is_probe
+        assert kwargs["spec_audit"] != is_probe
+        assert identity.diagnose == kwargs["diagnose"] == (not is_probe)
         return None
 
     monkeypatch.setattr("relay.worker.run_cli", create_autospec(run_cli, side_effect=isolated_launch))
@@ -164,6 +167,9 @@ def test_core_uses_same_database_and_separate_mcp_listeners(tmp_path, monkeypatc
     async def watchdog(self):
         job = {"id": "probe-1", "role": "audit", "kind": "probe", "lease_token": "fixture-lease"}
         assert await self.dispatch(job, "codex") is None
+        assert boundaries[0][1]["local_tokens"].verify(issued[-1]) is None
+        spec = dict(job, id="spec-1", kind="audit", payload={"kind": "spec"})
+        assert await self.dispatch(spec, "codex") is None
         assert boundaries[0][1]["local_tokens"].verify(issued[-1]) is None
 
     monkeypatch.setattr("relay.github.transport", repository)

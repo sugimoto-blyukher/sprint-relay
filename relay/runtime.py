@@ -13,6 +13,7 @@ from .changes import ChangeManager
 from .config import load_config
 from .github import Conflict, GitHub, GitHubError
 from .patrol import Patrol
+from .probe_diagnostics import emit
 from .security import OAuthVerifier, Principal, TokenVault
 from .workflow import Workflow
 
@@ -115,7 +116,7 @@ async def serve(config, config_path, path, management_token, product_token, disc
 
     async def dispatch(job, provider):
         probe = job["kind"] == "probe"
-        diagnose = probe and config.jobs.probe_diagnostics
+        diagnose = config.jobs.probe_diagnostics if probe else provider == "codex" and config.jobs.job_diagnostics
         identity = Principal(f"worker:{job['id']}", provider, job["role"], project, str(job["id"]),
                              synthetic_probe=probe, diagnose=diagnose)
         ttl = config.jobs.timeout_seconds
@@ -126,18 +127,22 @@ async def serve(config, config_path, path, management_token, product_token, disc
                                                    provider=provider, lease_token=job["lease_token"])
                 # A GitHub read may have consumed the last seconds of a lease.
                 await asyncio.to_thread(jobs.require_lease, job["id"], provider, job["lease_token"])
-            except PermissionError:
-                return "PERMISSION"
-            except (Conflict, ValueError):
-                return "INPUT"
-            except (GitHubError, OSError):
-                return "DEPENDENCY"
+            except (PermissionError, Conflict, ValueError, GitHubError, OSError) as exc:
+                if isinstance(exc, PermissionError):
+                    code, failure = "AUDIT_SNAPSHOT_DENIED", "PERMISSION"
+                elif isinstance(exc, (Conflict, ValueError)):
+                    code, failure = "AUDIT_SNAPSHOT_INVALID", "INPUT"
+                else:
+                    code, failure = "AUDIT_SNAPSHOT_DEPENDENCY_FAILED", "DEPENDENCY"
+                emit(code, enabled=diagnose, probe=False, job_id=job["id"], provider=provider, role=job["role"])
+                return failure
         token = vault.issue(identity, ttl, lease_token=job["lease_token"])
         try:
             return await run_cli(provider, project=project, role=job["role"], job_id=str(job["id"]),
                                  token=token, mcp_url=f"http://127.0.0.1:{config.mcp.local_port}/mcp",
                                  timeout_seconds=ttl, model=config.agents[provider].model, snapshot=snapshot,
-                                 probe=probe, diagnose=diagnose)
+                                 kind=job["kind"], diagnose=diagnose,
+                                 spec_audit=job["kind"] == "audit" and job["payload"].get("kind") == "spec")
         finally:
             vault.revoke(token)
 

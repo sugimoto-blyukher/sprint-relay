@@ -13,7 +13,7 @@ from relay import worker
 def request(**options):
     data = {"project": "demo", "job_id": "job123", "role": "audit", "token": "x" * 43,
             "mcp_url": "http://127.0.0.1:8765/mcp", "timeout_seconds": 2}
-    return worker.Launch(**(data | options))
+    return worker.Launch(**({"kind": "audit"} | data | options))
 
 
 def test_a13_mounts_and_environment_exclude_repository_and_parent_secrets(tmp_path, monkeypatch):
@@ -269,18 +269,18 @@ def test_probe_diagnostics_are_scoped_and_redacted(tmp_path, monkeypatch, caplog
     monkeypatch.setattr(worker, "_trusted", lambda path: None)
     monkeypatch.setattr(worker, "_isolate", lambda provider, bindings: ["fake-namespace", "/bin/agent"])
     monkeypatch.setattr(worker, "_invoke", AsyncMock(side_effect=invoke_result))
-    req = request(job_id="a" * 32, probe=True, diagnose=True)
+    req = request(job_id="a" * 32, kind="probe", diagnose=True)
     assert asyncio.run(worker._execute("codex", req)) == expected
     assert f"code={code} job={req.job_id} provider=codex role=audit" in caplog.text
     assert "SECRET_PAYLOAD" not in caplog.text and req.token not in caplog.text
     assert "mcp_servers.sprintrelay.required=true" in worker._arguments("codex", req)
     with pytest.raises(ValidationError):
-        request(diagnose=True)
+        request(kind="minutes", role="audit", diagnose=True)
 
 
 def test_codex_probe_events_report_calls_and_final_answer_without_payloads(caplog):
-    req = request(probe=True, diagnose=True)
-    observed = worker._CodexProbeEvents(req)
+    req = request(kind="probe", diagnose=True)
+    observed = worker._CodexEvents(req)
     records = [
         {"type": "thread.started", "thread_id": "never_log_thread"},
         {"type": "turn.started"},
@@ -310,7 +310,7 @@ def test_codex_probe_events_report_calls_and_final_answer_without_payloads(caplo
 
 
 def test_codex_probe_events_skip_oversized_lines_and_distinguish_text_only_output(caplog):
-    observed = worker._CodexProbeEvents(request(probe=True, diagnose=True))
+    observed = worker._CodexEvents(request(kind="probe", diagnose=True))
     observed.feed(b"x" * (observed.MAX_LINE + 1))
     observed.feed(b'\n{"type":"turn.completed"}\ninvalid event\n')
     observed.finish()
@@ -319,8 +319,8 @@ def test_codex_probe_events_skip_oversized_lines_and_distinguish_text_only_outpu
     assert "invalid event" not in caplog.text
 
 
-def test_codex_probe_flags_do_not_change_non_probe_launch():
-    args = worker._arguments("codex", request(probe=True, diagnose=True))
+def test_codex_probe_and_audit_have_distinct_noninteractive_permissions():
+    args = worker._arguments("codex", request(kind="probe", diagnose=True))
     assert "--json" in args
     assert 'mcp_servers.sprintrelay.omit_tools_from=["deferred","code_mode"]' in args
     assert {a for a in args if a.endswith('.approval_mode="approve"')} == {
@@ -329,6 +329,33 @@ def test_codex_probe_flags_do_not_change_non_probe_launch():
     }
     plain = worker._arguments("codex", request())
     assert "--json" not in plain
-    assert not any("omit_tools_from" in flag or ".approval_mode" in flag for flag in plain)
-    quiet_probe = worker._arguments("codex", request(probe=True))
+    assert {a for a in plain if a.endswith('.approval_mode="approve"')} == {
+        f'mcp_servers.sprintrelay.tools.{tool}.approval_mode="approve"' for tool in (
+            "get_project_context", "heartbeat_job", "report_job_failure", "get_audit_context", "submit_audit_result")}
+    assert "--json" in worker._arguments("codex", request(diagnose=True))
+    quiet_probe = worker._arguments("codex", request(kind="probe"))
     assert "--json" not in quiet_probe
+
+
+def test_full_specification_tool_is_limited_to_assigned_spec_audit():
+    flag = 'mcp_servers.sprintrelay.tools.get_specification.approval_mode="approve"'
+    assert flag in worker._arguments("codex", request(spec_audit=True))
+    assert flag not in worker._arguments("codex", request(snapshot=audit_snapshot()))
+    with pytest.raises(ValidationError):
+        request(kind="probe", spec_audit=True)
+
+
+@pytest.mark.parametrize("state,expected", [("RUNNING", "CLI_EXITED_WITHOUT_MCP_COMPLETION"),
+                                            ("COMPLETED", "JOB_COMPLETED")])
+def test_normal_diagnostics_use_durable_job_status(caplog, state, expected):
+    from relay.watchdog import Watchdog
+
+    store = Mock()
+    store.get.return_value = {"state": state}
+    store.config.jobs.job_diagnostics = True
+    store.config.jobs.probe_diagnostics = False
+    watchdog = Watchdog(store, "demo", dispatch=AsyncMock(return_value=None))
+    asyncio.run(watchdog._execute({"id": "a" * 32, "provider": "codex", "role": "management",
+                                   "kind": "minutes", "lease_token": "PRIVATE_LEASE"}))
+    assert f"job code={expected}" in caplog.text and "PRIVATE_LEASE" not in caplog.text
+    assert store.fail.called == (state == "RUNNING")

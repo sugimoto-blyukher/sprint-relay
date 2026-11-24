@@ -192,3 +192,64 @@ SHARED = {"get_project_context", "heartbeat_job", "get_specification", "get_task
           "get_progress", "get_audit_status", "report_job_failure"}
 AUDIT_ONLY = {"get_audit_context", "submit_audit_result"}
 ALLOWED = {"management": set(T) - AUDIT_ONLY, "audit": SHARED | AUDIT_ONLY}
+
+# Local CLI jobs are already claimed. Discovery/claim operations for Muse are
+# deliberately absent. Patrol retains its finding-backed follow-up actions.
+PROBE_TOOLS = ("get_project_context", "heartbeat_job")
+JOB_TOOLS = {
+    "minutes": ("get_transcript", "submit_minutes"),
+    "specification": ("get_specification", "submit_specification"),
+    "validation": ("get_specification", "request_audit", "submit_validation"),
+    "task_plan": ("get_specification", "submit_task_plan"),
+    "patrol": ("get_patrol_delta", "get_tasks", "get_progress", "get_schedule", "request_audit",
+               "get_audit_result", "propose_or_create_issue", "post_review_comment",
+               "update_task_priority", "publish_patrol_report", "complete_patrol"),
+    "audit": ("get_audit_context", "submit_audit_result"),
+}
+
+
+def codex_tools(role, kind, *, spec_audit=False):
+    if spec_audit and kind != "audit":
+        raise ValueError("Only specification audits can read the full audited revision")
+    if role not in ALLOWED:
+        raise ValueError("Unknown job role")
+    if kind == "probe":
+        return PROBE_TOOLS
+    if kind not in JOB_TOOLS or (role == "audit") != (kind == "audit"):
+        raise ValueError("Unexpected job kind for role")
+    selected = (*PROBE_TOOLS, "report_job_failure", *JOB_TOOLS[kind])
+    if spec_audit:
+        selected += ("get_specification",)
+    if not ALLOWED[role].issuperset(selected):
+        raise ValueError("Unexpected tool for role")
+    return selected
+
+
+TOOL_DESCRIPTIONS = {
+    "get_project_context": "Read project constraints and the assigned job kind, job ID and lease.",
+    "heartbeat_job": "Renew the active lease while processing the assigned job.",
+    "report_job_failure": "Report a classified failure for the assigned job and stop.",
+    "get_transcript": "Read the consented transcript of the assigned meeting.",
+    "submit_minutes": "Submit extracted minutes with exact transcript quotes to finish this job.",
+    "get_specification": "Read the assigned meeting's minutes or current revision and digest.",
+    "submit_specification": "Submit a draft with stable requirement IDs and evidence for human review.",
+    "submit_validation": "Submit checks for the reviewed digest and flag questions for human resolution.",
+    "submit_task_plan": "Submit requirement-linked tasks for the current human-approved digest.",
+    "get_patrol_delta": "Read the next page of the assigned patrol. Keep its snapshot_cursor for completion.",
+    "get_tasks": "Read paginated tasks and their current versions within the authorized scope.",
+    "get_progress": "Read current task counts, remaining effort and blockers.",
+    "get_schedule": "Read scheduled tasks, critical paths and risks.",
+    "request_audit": "Queue an asynchronous audit for a pinned SHA or specification digest.",
+    "get_audit_result": "Read a completed audit and its finding IDs for patrol follow-up.",
+    "propose_or_create_issue": "Record a repair issue for an eligible finding and current target.",
+    "post_review_comment": "Post a finding-backed comment on the audited PR revision.",
+    "update_task_priority": "Adjust a linked task's priority using its current version and finding.",
+    "publish_patrol_report": "Persist the patrol summary and references before completing the checkpoint.",
+    "complete_patrol": "Finish the assigned patrol with its processed snapshot_cursor after reporting.",
+    "get_audit_context": "Read the assigned pinned evidence and IDs to cite in audit findings.",
+    "submit_audit_result": "Finish the assigned audit with findings tied to its evidence IDs.",
+    "list_workflow_jobs": "List eligible workflow jobs for the current project.",
+    "claim_job": "Claim an eligible workflow job and obtain its lease.",
+    "claim_patrol": "Claim the current patrol slot and obtain its lease.",
+    "get_audit_status": "Read the state of an authorized audit job.",
+}

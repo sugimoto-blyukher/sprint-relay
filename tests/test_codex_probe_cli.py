@@ -1,26 +1,20 @@
 """Opt-in compatibility check with a native Codex CLI and a fake loopback model."""
 import asyncio
 import json
-import os
 from pathlib import Path
-import socket
 
 import pytest
-from starlette.responses import StreamingResponse
-from starlette.routing import Route
-import uvicorn
+from codex_fixture import FINAL, binary, call_item, loopback, offered_tools, run_cli
 
 from relay.config import Config
 from relay.gateway import Gateway
 from relay.jobs import JobStore
 from relay.mcp_server import create_app
-from relay.runtime import Listener
 from relay.security import Principal, TokenVault
-from relay.worker import Launch, _arguments, _CodexProbeEvents, _invoke, _prompt
+from relay.worker import Launch
 
 
 EXPECTED_TOOLS = {"get_project_context", "heartbeat_job"}
-NAMESPACE = "mcp__sprintrelay"
 
 
 @pytest.mark.parametrize("role,direct,approved", [
@@ -30,12 +24,9 @@ NAMESPACE = "mcp__sprintrelay"
     ("audit", True, True),
 ])
 def test_codex_0172_probe_tool_exposure(tmp_path, caplog, role, direct, approved):
-    configured = os.environ.get("SPRINTRELAY_TEST_CODEX")
-    if not configured:
-        pytest.skip("Set SPRINTRELAY_TEST_CODEX to a native Codex CLI 0.172.0 binary")
-    binary = Path(configured).resolve(strict=True)
+    path = binary()
 
-    async def run(sock):
+    async def run():
         config = Config.load(Path(__file__).resolve().parents[1] / "config.example.toml")
         config.agents["codex"] = config.agents["codex"].model_copy(update={"terms_confirmed": True})
         jobs = JobStore(tmp_path / "fixture.db", config)
@@ -52,18 +43,10 @@ def test_codex_0172_probe_tool_exposure(tmp_path, caplog, role, direct, approved
         supplied_arguments = {"project_id": project, "job_id": job["id"], "lease_token": lease,
                               "probe_answer": job["payload"]["challenge"][::-1]}
 
-        async def fake_model(request):
+        def reply(body, index):
             nonlocal context_forwarded
-            body = await request.json()
-            definitions = list(body.get("tools", []))
-            for item in body.get("input", []):
-                if item.get("type") == "additional_tools":
-                    definitions.extend(item.get("tools", []))
-            offered = {child["name"] for spec in definitions if spec.get("name") == NAMESPACE
-                       for child in spec.get("tools", [])}
+            offered = set(offered_tools(body))
             turns.append(offered)
-            index = len(turns)
-            response_id = f"fixture-response-{index}"
             if direct and index <= 2 and turns[0] == EXPECTED_TOOLS:
                 if index == 2 and approved:
                     outputs = [item for item in body.get("input", []) if item.get("type") == "function_call_output"]
@@ -71,73 +54,30 @@ def test_codex_0172_probe_tool_exposure(tmp_path, caplog, role, direct, approved
                     context_forwarded = job["payload"]["challenge"] in json.dumps(outputs)
                 name = "get_project_context" if index == 1 else "heartbeat_job"
                 args = {"project_id": project} if index == 1 else supplied_arguments
-                item = {"type": "function_call", "namespace": NAMESPACE, "name": name,
-                        "call_id": f"fixture-call-{index}", "arguments": json.dumps(args)}
+                return call_item(name, args, index)
+            return FINAL
+
+        async with loopback(app, reply) as port:
+            req = Launch(job_id=job["id"], project=project, role=role, token=token,
+                         mcp_url=f"http://127.0.0.1:{port}/mcp", timeout_seconds=30,
+                         model="gpt-6.2-sol", kind="probe", diagnose=True)
+            observer = await run_cli(path, tmp_path, port, req, direct=direct, approved=approved)
+            assert turns and turns[0] == (EXPECTED_TOOLS if direct else set())
+            if approved:
+                assert context_forwarded
+                assert jobs.get(job["id"])["state"] == "COMPLETED"
+                assert [p["role"] for p in jobs.status(project)["cli_proofs"]] == [role]
+                assert {name for code, name in observer.seen if code == "CLI_MCP_CALL_COMPLETED"} == EXPECTED_TOOLS
             else:
-                item = {"type": "message", "role": "assistant", "id": "mock-answer",
-                        "content": [{"type": "output_text", "text": "PRIVATE_FIXTURE_ANSWER"}]}
-            events = [
-                {"type": "response.created", "response": {"id": response_id}},
-                {"type": "response.output_item.done", "item": item},
-                {"type": "response.completed", "response": {"id": response_id}},
-            ]
-            return StreamingResponse(
-                iter(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events),
-                media_type="text/event-stream",
-            )
-
-        app.router.routes.append(Route("/fixture/responses", fake_model, methods=["POST"]))
-        port = sock.getsockname()[1]
-        server = Listener(uvicorn.Config(app, access_log=False, log_config=None))
-        serving = asyncio.create_task(server.serve(sockets=[sock]))
-        try:
-            async with asyncio.timeout(30):
-                while not server.started:
-                    await asyncio.sleep(.01)
-                req = Launch(job_id=job["id"], project=project, role=role, token=token,
-                             mcp_url=f"http://127.0.0.1:{port}/mcp", timeout_seconds=30,
-                             model="gpt-6.2-sol", probe=True, diagnose=True)
-                env = {"HOME": str(tmp_path), "TMPDIR": str(tmp_path), "PATH": "/usr/bin:/bin",
-                       "LANG": "C.UTF-8", "SPRINTRELAY_JOB_TOKEN": token}
-                rc, version, _ = await _invoke([str(binary), "--version"], env, diagnostics=True)
-                assert rc == 0 and version.strip() == b"codex-cli 0.172.0"
-                args = _arguments("codex", req)[:-1]
-                if not direct:
-                    index = args.index('mcp_servers.sprintrelay.omit_tools_from=["deferred","code_mode"]')
-                    del args[index - 1:index + 1]
-                if not approved:
-                    for name in EXPECTED_TOOLS:
-                        index = args.index(f'mcp_servers.sprintrelay.tools.{name}.approval_mode="approve"')
-                        del args[index - 1:index + 1]
-                # A synthetic provider speaks only to the loopback fixture.
-                # Production account authentication and inference are not exercised.
-                args.extend(["-c", 'model_provider="fixture"', "-c",
-                             f'model_providers.fixture={{name="Fixture",base_url="http://127.0.0.1:{port}/fixture",'
-                             'wire_api="responses",request_max_retries=0,stream_max_retries=0}', "-"])
-                observer = _CodexProbeEvents(req)
-                rc, _, _ = await _invoke([str(binary), *args], env, _prompt(req).encode(), events=observer)
-                assert rc == 0
-                assert turns and turns[0] == (EXPECTED_TOOLS if direct else set())
-                if approved:
-                    assert context_forwarded
-                    assert jobs.get(job["id"])["state"] == "COMPLETED"
-                    assert [p["role"] for p in jobs.status(project)["cli_proofs"]] == [role]
-                    assert {name for code, name in observer.seen if code == "CLI_MCP_CALL_COMPLETED"} == EXPECTED_TOOLS
+                assert jobs.get(job["id"])["state"] == "RUNNING"
+                assert not jobs.status(project)["cli_proofs"]
+                if direct:
+                    assert {name for code, name in observer.seen if code == "CLI_MCP_APPROVAL_REQUIRED"} == EXPECTED_TOOLS
+                    assert "code=MCP_GET_PROJECT_CONTEXT" not in caplog.text
                 else:
-                    assert jobs.get(job["id"])["state"] == "RUNNING"
-                    assert not jobs.status(project)["cli_proofs"]
-                    if direct:
-                        assert {name for code, name in observer.seen if code == "CLI_MCP_APPROVAL_REQUIRED"} == EXPECTED_TOOLS
-                        assert "code=MCP_GET_PROJECT_CONTEXT" not in caplog.text
-                    else:
-                        assert not any(code.startswith("CLI_MCP_CALL") for code, _ in observer.seen)
-                assert ("CLI_FINAL_RESPONSE_PRESENT", None) in observer.seen
-                assert "http=200" in caplog.text and "tools=2" in caplog.text
-                assert all(secret not in caplog.text for secret in (token, lease, "PRIVATE_FIXTURE_ANSWER"))
-        finally:
-            server.should_exit = True
-            await serving
+                    assert not any(code.startswith("CLI_MCP_CALL") for code, _ in observer.seen)
+            assert ("CLI_FINAL_RESPONSE_PRESENT", None) in observer.seen
+            assert "http=200" in caplog.text and "tools=2" in caplog.text
+            assert all(secret not in caplog.text for secret in (token, lease, "PRIVATE_FIXTURE_ANSWER"))
 
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        asyncio.run(run(sock))
+    asyncio.run(run())
