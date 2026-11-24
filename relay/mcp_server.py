@@ -31,52 +31,67 @@ WIRE_CODES = {"initialize": "MCP_INITIALIZE", "tools/list": "MCP_TOOLS_LIST"}
 CALL_CODES = {"get_project_context": "MCP_GET_PROJECT_CONTEXT", "heartbeat_job": "MCP_HEARTBEAT_JOB"}
 
 
-def _diagnostic(principal, code, *, status=None):
+def _diagnostic(principal, code, *, status=None, tool_count=None):
     emit(code, enabled=principal.diagnose, job_id=principal.job_id, provider=principal.provider,
-         role=principal.role, status=status)
+         role=principal.role, status=status, tool_count=tool_count)
+
+
+class _ProbeJSON:
+    """Observe a bounded JSON message without changing what the SDK sends or receives."""
+
+    def __init__(self):
+        self.data = bytearray()
+        self.oversized = False
+
+    def append(self, chunk):
+        if self.oversized:
+            return
+        if len(self.data) + len(chunk) > 8192:
+            self.data.clear()
+            self.oversized = True
+        else:
+            self.data.extend(chunk)
+
+    def object(self):
+        try:
+            parsed = json.loads(self.data)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, UnicodeError, RecursionError):
+            return {}
 
 
 async def _observe_probe(transport, principal, scope, receive, send):
-    # Observe only a bounded method name for authenticated probe requests. The
-    # SDK still owns HTTP parsing, validation and the actual response.
-    body = bytearray()
-    oversized = False
+    request, response = _ProbeJSON(), _ProbeJSON()
+    status = None
+    code = "MCP_HTTP"
 
     async def observed_receive():
-        nonlocal oversized
         message = await receive()
-        if message["type"] == "http.request" and not oversized:
-            chunk = message.get("body", b"")
-            if len(body) + len(chunk) <= 8192:
-                body.extend(chunk)
-            else:
-                body.clear()
-                oversized = True
+        if message["type"] == "http.request":
+            request.append(message.get("body", b""))
         return message
 
-    status = None
-
     async def observed_send(message):
-        nonlocal status
+        nonlocal status, code
         if message["type"] == "http.response.start":
-            code = "MCP_HTTP"
-            try:
-                parsed = json.loads(body)
-                if isinstance(parsed, dict) and isinstance(parsed.get("method"), str):
-                    code = WIRE_CODES.get(parsed["method"], code)
-            except (ValueError, UnicodeError, RecursionError):
-                pass
+            method = request.object().get("method")
+            if isinstance(method, str):
+                code = WIRE_CODES.get(method, code)
             status = message["status"]
             _diagnostic(principal, code, status=status)
-        elif message["type"] == "http.response.body" and not message.get("more_body"):
-            payload = message.get("body", b"")
-            if 0 < len(payload) <= 8192:
-                try:
-                    parsed = json.loads(payload)
-                    if isinstance(parsed, dict) and "error" in parsed:
-                        _diagnostic(principal, "MCP_RPC_ERROR", status=status)
-                except (ValueError, UnicodeError, RecursionError):
-                    pass
+        elif message["type"] == "http.response.body":
+            response.append(message.get("body", b""))
+            if not message.get("more_body"):
+                result = response.object()
+                if "error" in result:
+                    _diagnostic(principal, "MCP_RPC_ERROR", status=status)
+                elif code == "MCP_TOOLS_LIST":
+                    payload = result.get("result")
+                    items = payload.get("tools") if isinstance(payload, dict) else None
+                    if status == 200 and result.get("jsonrpc") == "2.0" and isinstance(items, list):
+                        _diagnostic(principal, "MCP_TOOLS_LIST_RESULT", status=status, tool_count=len(items))
+                    else:
+                        _diagnostic(principal, "MCP_RESPONSE_UNCLASSIFIED", status=status)
         await send(message)
 
     await transport.handle_request(scope, observed_receive, observed_send)

@@ -118,9 +118,11 @@ sudo ss -ltn 'sport = :8371'
 
 ### Probe の実行と合格条件
 
+Codex 0.172.0 の追加修正では、合成 Probe の二つの MCP ツールを直接公開し、CLI 内のツール単位の対話承認を事前に指定します。既存サービスへの更新は、レビュー済みソースから `sudo bash deploy/redeploy.sh` を使います。 [0.172.0 の再現とソース調査](codex-probe.md)
+
 1. `/relay status` の `cli_proofs` を記録します。合成 Probe は実データへの同意や `verified=true` を必要としません。`agents.codex.enabled` と `terms_confirmed` が有効で、処理を一時停止中なら `/relay resume` を実行します。
 2. 設定済みの承認者がタスクチャンネルで `/relay retry provider:codex` を実行します。両役割のジョブ ID を控えます。片方を確認する場合は `role:management` または `role:audit` を指定します。同じプロバイダーの役割は順番に実行されます。既存ジョブがプロバイダーを使用中ならキューで待機します。ベンダー制限で `cooldown` が返った場合は表示時刻以降に要求します。
-3. 別端末で Core と Worker の固定コードを確認します。実行 ID をキーに、初期化 HTTP 200、ツール列挙 HTTP 200、`MCP_GET_PROJECT_CONTEXT`、`MCP_HEARTBEAT_JOB`、`PROBE_COMPLETED` を確認します。CLI 終了コードも診断に使います。
+3. 別端末で Core と Worker の固定コードを確認します。実行 ID をキーに、初期化 HTTP 200、`MCP_TOOLS_LIST_RESULT http=200 tools=2`、`MCP_GET_PROJECT_CONTEXT`、`MCP_HEARTBEAT_JOB`、`PROBE_COMPLETED` を確認します。CLI 終了コードも診断に使います。
 4. `/relay jobs` で両ジョブが `COMPLETED` になり、`/relay status` の `cli_proofs` の `codex / management` と `codex / audit` が今回の実行時刻に更新されたことを確認します。この両方が実アカウントで確認できた時点で疎通試験合格です。診断後は `probe_diagnostics = false` に戻せます。
 
 ```sh
@@ -138,6 +140,10 @@ sudo journalctl -u sprintrelay.service -u sprintrelay-worker@codex.service \
 | `INFERENCE_TRANSPORT_FAILED`, `MCP_CLIENT_INIT_FAILED`, `MCP_CLIENT_AUTH_FAILED`, `MCP_CLIENT_LIST_FAILED` | CLI の既知の診断パターンから得た通信・初期化・認証・列挙の候補 |
 | `MCP_AUTH_ACCEPTED`, `MCP_AUTH_REJECTED` | サーバーでの Bearer 判定。拒否は未認証なのでジョブ情報なし |
 | `MCP_INITIALIZE`, `MCP_TOOLS_LIST`, `MCP_HTTP`, `MCP_RPC_ERROR` | 受信したプロトコル段階、HTTP ステータスと JSON-RPC エラーの有無 |
+| `MCP_TOOLS_LIST_RESULT`, `MCP_RESPONSE_UNCLASSIFIED` | 正常な一覧応答のツール数、または一覧応答を分類できなかったこと |
+| `CLI_MCP_CALL_STARTED`, `CLI_MCP_CALL_COMPLETED`, `CLI_MCP_CALL_FAILED`, `CLI_MCP_APPROVAL_REQUIRED` | Codex 側のツール呼び出しと承認判定。HTTP 送信前の失敗も区別可能 |
+| `CLI_TURN_COMPLETED`, `CLI_TURN_FAILED`, `CLI_FINAL_RESPONSE_PRESENT`, `CLI_FINAL_RESPONSE_ABSENT` | 推論ターンと、完了ターンで観測されたテキスト応答の有無 |
+| `CLI_JSON_UNREADABLE`, `CLI_JSON_TRUNCATED`, `CODE_MODE_HOST_UNAVAILABLE` | JSONL を観測できなかった箇所や Code Mode ホスト警告 |
 | `MCP_GET_PROJECT_CONTEXT`, `MCP_HEARTBEAT_JOB`, `MCP_OTHER_CALL`, `MCP_TOOL_FAILED` | ツールハンドラー到達とエラーの有無 |
 | `CLI_EXITED_WITHOUT_MCP_COMPLETION`, `TIMEOUT`, `PROBE_COMPLETED` | 終了コード 0 での未完了、時間切れ、またはリース検証を経た完了 |
 

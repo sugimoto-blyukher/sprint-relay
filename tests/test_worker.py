@@ -276,3 +276,59 @@ def test_probe_diagnostics_are_scoped_and_redacted(tmp_path, monkeypatch, caplog
     assert "mcp_servers.sprintrelay.required=true" in worker._arguments("codex", req)
     with pytest.raises(ValidationError):
         request(diagnose=True)
+
+
+def test_codex_probe_events_report_calls_and_final_answer_without_payloads(caplog):
+    req = request(probe=True, diagnose=True)
+    observed = worker._CodexProbeEvents(req)
+    records = [
+        {"type": "thread.started", "thread_id": "never_log_thread"},
+        {"type": "turn.started"},
+        {"type": "item.started", "item": {"type": "mcp_tool_call", "server": "sprintrelay",
+                                         "tool": "get_project_context", "arguments": "SECRET_ARGUMENTS"}},
+        {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "sprintrelay",
+                                           "tool": "get_project_context", "status": "completed", "result": "SECRET_RESULT"}},
+        {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "sprintrelay",
+                                           "tool": "heartbeat_job", "status": "failed", "error": "SECRET_ERROR"}},
+        {"type": "item.completed", "item": {"type": "mcp_tool_call", "server": "sprintrelay",
+                                           "tool": "SECRET_TOOL", "status": "completed"}},
+        {"type": "item.completed", "item": {"type": "error",
+                                           "message": "Code Mode is unavailable; install codex-code-mode-host SECRET_PATH"}},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "SECRET_ANSWER"}},
+        {"type": "turn.completed"},
+    ]
+    stream = b"\n".join(json.dumps(record).encode() for record in records)
+    for start in range(0, len(stream), 31):
+        observed.feed(stream[start:start + 31])
+    observed.finish()
+
+    assert {code for code, _ in observed.seen} == {
+        "CLI_MCP_CALL_STARTED", "CLI_MCP_CALL_COMPLETED", "CLI_MCP_CALL_FAILED",
+        "CLI_TURN_COMPLETED", "CLI_FINAL_RESPONSE_PRESENT", "CODE_MODE_HOST_UNAVAILABLE"}
+    assert "tool=get_project_context" in caplog.text and "tool=heartbeat_job" in caplog.text
+    assert "SECRET" not in caplog.text and "never_log_thread" not in caplog.text
+
+
+def test_codex_probe_events_skip_oversized_lines_and_distinguish_text_only_output(caplog):
+    observed = worker._CodexProbeEvents(request(probe=True, diagnose=True))
+    observed.feed(b"x" * (observed.MAX_LINE + 1))
+    observed.feed(b'\n{"type":"turn.completed"}\ninvalid event\n')
+    observed.finish()
+    assert {code for code, _ in observed.seen} == {
+        "CLI_JSON_TRUNCATED", "CLI_JSON_UNREADABLE", "CLI_TURN_COMPLETED", "CLI_FINAL_RESPONSE_ABSENT"}
+    assert "invalid event" not in caplog.text
+
+
+def test_codex_probe_flags_do_not_change_non_probe_launch():
+    args = worker._arguments("codex", request(probe=True, diagnose=True))
+    assert "--json" in args
+    assert 'mcp_servers.sprintrelay.omit_tools_from=["deferred","code_mode"]' in args
+    assert {a for a in args if a.endswith('.approval_mode="approve"')} == {
+        'mcp_servers.sprintrelay.tools.get_project_context.approval_mode="approve"',
+        'mcp_servers.sprintrelay.tools.heartbeat_job.approval_mode="approve"',
+    }
+    plain = worker._arguments("codex", request())
+    assert "--json" not in plain
+    assert not any("omit_tools_from" in flag or ".approval_mode" in flag for flag in plain)
+    quiet_probe = worker._arguments("codex", request(probe=True))
+    assert "--json" not in quiet_probe
