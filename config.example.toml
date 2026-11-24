@@ -55,3 +55,57 @@ demo = "2030-01-20T18:30:00+09:00"
 "10103" = [["2030-01-20T09:00+09:00", "2030-01-20T12:00+09:00"], ["2030-01-20T13:00+09:00", "2030-01-20T18:30+09:00"]]
 "10104" = [["2030-01-20T09:00+09:00", "2030-01-20T12:00+09:00"], ["2030-01-20T13:00+09:00", "2030-01-20T18:30+09:00"]]
 "10105" = [["2030-01-20T10:00+09:00", "2030-01-20T12:00+09:00"], ["2030-01-20T13:00+09:00", "2030-01-20T17:00+09:00"]]
+
+[agents.management]
+order = ["muse", "claude_code", "codex"]
+[agents.technical_audit]
+order = ["codex", "antigravity"]
+
+# No agent receives project data until its access, terms and
+# synthetic interoperability checks have been confirmed by the operator.
+[agents.muse]
+enabled = true
+transport = "remote_mcp"
+verified = false
+terms_confirmed = false
+schedule_confirmed = false
+[agents.codex]
+enabled = true
+executable = "codex"
+verified = false
+terms_confirmed = false
+[agents.claude_code]
+enabled = false
+executable = "claude"
+[agents.antigravity]
+enabled = false
+executable = "agy"
+
+[patrol]
+interval_minutes = 45
+grace_minutes = 10
+[watchdog]
+interval_seconds = 60
+recovery_interval_minutes = 45
+max_backoff_minutes = 360
+[jobs]
+timeout_seconds = 600
+max_retries = 1
+max_audit_concurrency = 1
+max_management_concurrency = 1
+[github_sync]
+interval_seconds = 60
+[privacy]
+project_providers = [] # Approved recipients of project data; meetings also need explicit consent.
+raw_retention_days = 30
+max_input_bytes = 1048576
+[mcp]
+local_bind = "127.0.0.1"
+local_port = 8371
+remote_enabled = false
+remote_port = 8372
+# issuer = "https://identity.example"
+# jwks_url = "https://identity.example/oauth/jwks"
+# resource = "https://relay.example/mcp"
+# client_id = "registered-connector-client"
+# subject = "approved-muse-account"

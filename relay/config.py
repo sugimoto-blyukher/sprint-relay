@@ -7,6 +7,9 @@ from pathlib import Path
 import re
 import tomllib
 
+from .settings import (AgentSettings, JobSettings, MCPSettings, PatrolSettings, PrivacySettings,
+                       SyncSettings, WatchdogSettings, agent_settings)
+
 
 ROLES = ("design", "frontend", "backend", "hardware")
 TEAM = {"design": 2, "frontend": 1, "backend": 1, "hardware": 1}
@@ -26,6 +29,16 @@ class Config:
     product_repos: tuple[str, ...] = ()
     calendar: dict = field(default_factory=dict)
     guild_id: str = ""
+
+    agents: dict[str, AgentSettings] = field(default_factory=lambda: agent_settings({}))
+    management_order = ("muse", "claude_code", "codex")
+    audit_order = ("codex", "antigravity")
+    patrol: PatrolSettings = field(default_factory=PatrolSettings)
+    watchdog: WatchdogSettings = field(default_factory=WatchdogSettings)
+    jobs: JobSettings = field(default_factory=JobSettings)
+    github_sync: SyncSettings = field(default_factory=SyncSettings)
+    privacy: PrivacySettings = field(default_factory=PrivacySettings)
+    mcp: MCPSettings = field(default_factory=MCPSettings)
 
     def __post_init__(self):
         if not self.product_repos:
@@ -74,6 +87,14 @@ def load_config(path: str | Path) -> Config:
     usernames = [name.casefold() for name in github_users.values()]
     if len(usernames) != len(set(usernames)):
         raise ValueError("duplicate GitHub login in member mapping")
+    mcp = MCPSettings(**data.get("mcp", {}))
+    agents = agent_settings(data.get("agents", {}))
+    if not mcp.remote_enabled:
+        # A disabled connector cannot claim jobs, even if a previous smoke test succeeded.
+        agents["muse"] = agents["muse"].model_copy(update={"schedule_confirmed": False})
     return Config(members, approvers, github_users, default_repo, management_repo,
                   channels, github.get("project_id") or None, product_repos,
-                  data.get("calendar", {}), guild_id)
+                  data.get("calendar", {}), guild_id, agents,
+                  PatrolSettings(**data.get("patrol", {})), WatchdogSettings(**data.get("watchdog", {})),
+                  JobSettings(**data.get("jobs", {})), SyncSettings(**data.get("github_sync", {})),
+                  PrivacySettings(**data.get("privacy", {})), mcp)

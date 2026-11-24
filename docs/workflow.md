@@ -1,62 +1,82 @@
-# Meeting to approved issues
+# 会議・仕様・タスク発行
 
-Use the configured private meetings channel. Restrict access to the team and the bot before submitting text. The operator of the service can read its SQLite file and backups. Store both under the service account's private data directory. The approved Markdown is archived in the private management repository. Approved task descriptions, acceptance criteria and deliverables appear in the configured product repository. Review them for the intended audience.
+運営リポジトリは private に設定する。Discord の会議チャンネルとサービスの状態ディレクトリへのアクセスはチームと運営者に限定する。運営者は SQLite とバックアップを読める。正式な承認仕様は運営リポジトリ、タスクは同リポジトリの台帳と設定された製品リポジトリの Issues に保存される。
 
-1. Use **Apps → Import transcript** on a meeting message, or use `/meeting import` with text or a UTF-8 Markdown/text attachment. Confirm consent only when all participants have agreed to external AI processing. The message context menu preserves the source message link and supports safe retries against the same source.
-2. Use `/spec draft`. With a configured provider and consent, the service extracts minutes and drafts Markdown. To work manually, attach a Markdown draft and a JSON minutes object.
-3. Use `/spec show` to inspect the Markdown and minutes. Submit the human-reviewed Markdown with `/spec revise`, the displayed digest and the reason for the change. Supply corrected minutes if necessary. Include purpose, scope, functional and nonfunctional requirements, interfaces, owner, acceptance and open questions. Carry stable identifiers such as `REQ-001` across revisions. Record decisions on feature, technology, interface or scope changes. The digest returned by revise identifies the meeting, parent revision, text, minutes, author and reason. Historical revisions are accessible through their parent digests.
-4. Run `/spec validate` on that exact digest. The check returns findings and blocking questions. Resolve blockers through a new human revision and run another check. The reviewer has no write access to the specification. For a provider outage, an authorized approver can import a structured review from an actual AI-assisted check.
-5. Use `/spec approve` as a configured approver. With an enabled provider, tasks are generated automatically. For manual publication, attach the task definitions as a JSON array. Approval applies to the current validated digest. The complete task graph is validated first. During publication, retry the same command and digest after a network failure. The service reuses the saved plan.
-6. A later scope change starts with a new revision of the **same meeting**. Keep the previous stable task keys in the new plan for work that continues. Include the entire revised plan. New keys create issues, and omitted keys become cancellation candidates. Unstarted tasks can be updated. Owners decide ongoing or review-stage changes, and approvers explicitly confirm a changed contractual deadline on unstarted work. Completed work receives a separate follow-up issue. A role or repository transfer requires a new task key. Inspect `/scope pending` and use `/scope resolve` to record decisions.
+## 会議の開始から初回発行まで
 
-## Manual attachments
+1. 非公開の会議チャンネルで対象メッセージの **Apps → Import transcript** を選ぶ。または `/meeting import` に本文か UTF-8 の `.txt` / `.md` を一つ渡す。初期上限は 1 MiB。メッセージのソース参照と添付ファイルの SHA-256 を使って再送を識別する。会議の投稿だけでは開始されない。
+2. 全参加者が認めた処理先を `providers` に指定し、同意を確認する。指定例は `muse,codex`。各処理先には運営者が設定した `privacy.project_providers` の許可も必要。代替エージェントへの引き継ぎにも同じ制限が適用される。外部へ出せない会議は宛先を空にして手動で扱う。承認者は `/meeting consent` で参加者が許可した宛先を更新できる。`none` で取り消す。既に外部で処理された情報の保持は各サービスの設定に従う。
+3. 取り込みの受付 ID を保管する。確認済みのエージェントが議事録と仕様初稿のジョブを順に取得する。議事録にはソース、概要、決定事項と根拠引用、理由、影響、提案、未決事項を記録する。人間は `/spec show` で原意を確認する。転載された指示や第三者の提案に権限を与えない。
+4. `/spec revise` で表示された digest、査読後の Markdown、理由を提出する。修正箇所がなくても同じ Markdown と確認理由を提出できる。誤った議事録は修正版 JSON を添付する。Markdown には目的、対象者、ユースケース、スコープ、機能・非機能要件、安定した要件 ID（例 `REQ-001`）、インターフェース、担当、受入条件、制約、未決事項を含める。旧版と diff、著者、理由は `/spec show` から確認できる。
+5. 査読後、その版の整合性検証が自動で始まる。必要なら技術監査にジョブを引き渡して管理 lease を解放し、結果到着後に検証を再開する。重大指摘には人間の再査読が必要。AI が提出した改行形式の正規化には新しい digest を付けて再検証する。それ以外の本文変更案は人間に返す。
+6. 承認者が最終版のレポートと diff を読み、`/spec approve` にその digest を指定する。プロジェクト、会議、digest、検証結果のハッシュ、承認者、承認時刻が固定される。承認後に計画ジョブが自動生成される。担当と要件リンク、1〜4 時間の見積、依存グラフを検証し、計画を永続化して発行に進む。通信が途切れても同じ計画の続きを再開する。定期同期で初期予測が反映される。
+7. private の製品リポジトリには審査済み仕様から自動でタスクを発行できる。public の製品リポジトリには承認者が公開用に確認・編集したタスク JSON を `/spec approve` に添付する。公開対象には説明、依存キー、成果物、受入条件、要件 ID、Issue タイトルが含まれる。
+8. 後からスコープを変更する場合は同じ会議の新しい版を査読・検証・承認する。新計画には継続タスクのキーを残す。作業中・レビュー中の変更は保留し、完了済みの変更は追補 Issue、削除候補はキャンセル判断として残す。 `/scope pending` と `/scope resolve` で処理する。
 
-A minutes file separates accepted decisions from suggestions and unresolved questions. Example with fictional data:
+現在の段階と次のジョブは `/spec show` で確認する。 `WAITING_AUDIT` は任意の技術監査待ち、`NEEDS_REVISION` は人間の判断待ち、`PLANNING` は承認後の計画待ち、`PUBLISHING` は発行待ちまたは再試行中を表す。Discord の通知は識別子と状態に限定する。別の会議の発行に失敗していても、処理可能な会議の進行と通知配信は続く。
+
+## 手動で進める場合
+
+`/spec draft` に Markdown と議事録 JSON を添付する。以下は合成データの例。外部エージェントが提出する決定事項は原文の引用を必要とする。人間の旧形式の議事録（決定事項が文字列の配列）も読み込める。
 
 ```json
 {
-  "proposals": ["Add an export endpoint."],
-  "decisions": ["Export the agreed fields as CSV."],
+  "summary": "CSV 出力の最小仕様を合意した。",
+  "decisions": [{
+    "text": "2 列の CSV を出力する",
+    "quote": "まず名前と日付の CSV を出そう。",
+    "rationale": "デモ用に既存表計算へ取り込むため",
+    "impact": "バックエンドのダウンロード処理"
+  }],
+  "proposals": ["後でグラフを追加する"],
   "open_questions": []
 }
 ```
 
-To obtain an external review, give the reviewer the revised Markdown, its digest and the approved minutes. Request a finding for each of the six checks below and a list of blocking questions. The service checks the digest, fields, consent and submitting approver. The approver attests that the report came from the recorded reviewer. Use an authorized offline AI model if participants have withheld external consent. Only an actual offline check may use `"processing": "local"`. If no permitted AI reviewer is available, continue drafting and revising and leave publication pending. Fill the placeholders with the actual findings.
+承認者は `/spec validate` に、実際に AI が行った整合性検証を JSON として提出できる。外部の確認にはその処理先への同意が必要。外部への送信が許可されていない場合は、運営者が許可したオフラインモデルで検証する。以下の `local` はオフライン処理を表す。承認者は確認元と結果に責任を持つ。許可された AI による検証を取得できない間は査読と日常のタスク操作を続け、発行を保留する。
 
 ```json
 {
-  "revision": "<full digest from /spec revise>",
-  "provider": "<reviewing provider and model>",
+  "revision": "<査読済みの完全な digest>",
+  "provider": "<実際のオフライン検証モデル>",
   "processing": "local",
   "checks": {
-    "technical": "<findings>",
-    "logical": "<findings>",
-    "cross_team": "<findings>",
-    "completeness": "<findings>",
-    "feasibility": "<findings>",
-    "traceability": "<reference the decisions and requirement IDs>"
+    "technical": "<技術的な根拠>",
+    "logical": "<論理的整合性>",
+    "cross_team": "<担当間の契約>",
+    "completeness": "<不足の有無>",
+    "feasibility": "<期間・人員から見た実現性>",
+    "traceability": "<決定事項と要件 ID の対応>"
   },
   "blocking_questions": []
 }
 ```
 
-A minimal manual task plan for a specification containing `REQ-001`:
+計画の手動入力には以下のような JSON 配列を使う。依存先が必要な場合は実在するタスクキーを指定する。任意の `repo` は設定済みの製品リポジトリ、任意の `deadline` は UTC オフセット付きの ISO 日時。エージェントが発行する計画では担当者、期限、状態を入力できない。
 
 ```json
 [
   {
     "key": "export-csv",
-    "title": "Export the agreed report fields",
-    "description": "Implement a CSV export of the existing report.",
+    "title": "合意した列を CSV 出力する",
+    "description": "既存リストの名前と日付を出力する。",
     "role": "backend",
     "estimated_hours": 2,
     "priority": 1,
     "dependencies": [],
     "requirement_ids": ["REQ-001"],
-    "deliverables": ["CSV download endpoint"],
-    "acceptance": ["A fixture with two records produces the agreed header and two data rows."]
+    "deliverables": ["CSV ダウンロード処理"],
+    "acceptance": ["2 行の fixture からヘッダーとデータ 2 行が出力される"]
   }
 ]
 ```
 
-Optional task fields include a configured product repository in `repo` and an ISO timestamp with UTC offset in `deadline`. Role determines the engineering owner. Designers claim their own tasks. Keep each task within 1–4 hours and cover all the specification's requirement IDs. Include a single primary role for cross-team work.
+## 保存と旧データ
+
+生の文字起こしは初期 30 日で読み出しを停止し、定期処理で本文を削除する。重複防止用のハッシュ、正式仕様、議事録、承認記録は残す。バックアップには個別の保持・破棄方針を適用する。v1 からは従来の digest、承認者、検証結果、発行済みの対応を引き継ぐ。旧データの包括的な同意から外部の宛先を推定しない。旧承認の日時が不明な場合は空欄のまま残す。取得日時不明の旧本文は期限切れとして扱う。同じソース・同じ内容を明示的に再取り込みすると、新しい保持期間と許可先が登録される。
+
+v1 で発行途中だった計画には、タスク本文を公開用に確認した記録がない。private の製品リポジトリには保存済み計画の発行を再開する。public の場合（計画後にリポジトリが public になった場合を含む）は、対象タスクの自動発行・同期を保留する。承認者は次の手順で、既に保存済みの計画全体の公開可否を判断する。
+
+1. 非公開の会議チャンネルで対象 digest の `/spec show` を実行する。`pending_plan` に含まれる全タスクの宛先と本文を確認し、`plan_hash` を控える。
+2. 全内容を公開してよい場合に限り、`{"confirm_public_release": true, "plan_hash": "<表示された値>"}` を JSON ファイルに保存し、同じ会議・digest の `/spec approve` の `tasks` に添付する。サービスは承認者、時刻、会議、digest、計画ハッシュを記録する。
+3. 発行途中で再停止しても、そのままの計画と既存の Issue 対応を使って復旧する。既存計画にタスク配列を再提出しても元の計画が使われる。差し替えや公開確認の代用にはならない。内容を公開できない場合は確認を保留し、製品リポジトリを private に戻せるか運営者が判断する。

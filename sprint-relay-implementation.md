@@ -1,3 +1,5 @@
+> Superseded by [SprintRelay v2](sprint-relay-v2-specification.md). This document is retained for the original implementation history.
+
 # SprintRelay — Codex implementation brief
 
 ## Goal and scope

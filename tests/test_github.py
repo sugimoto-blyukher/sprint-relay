@@ -34,7 +34,7 @@ class FakeAPI:
                           {"name": "Start date", "id": "start", "dataType": "DATE"}]
                 return {"data": {"node": {"fields": {"nodes": fields}}}}
             return {"data": {}}
-        if route == "/repos/owner/manage":
+        if route.startswith("/repos/") and route.count("/") == 3:
             return {"private": self.private}
         if "/contents/" in route:
             if method == "GET":
@@ -240,3 +240,60 @@ def test_preserve_issue_notes_when_rendering_or_repairing_markers(service):
     repaired = issue["body"]
     svc.poll()
     assert issue["body"] == repaired
+
+
+def test_bot_and_app_comments_cannot_impersonate_configured_humans(service):
+    svc, api = service
+    svc.publish([task()])
+    api.comments[1] = [
+        {"id": 6, "body": "!relay start", "user": {"type": "Bot", "login": "Alice"}},
+        {"id": 7, "body": "!relay start", "user": {"type": "User", "login": "Alice"},
+         "performed_via_github_app": {"id": 99}},
+    ]
+    svc.poll()
+    assert svc.list_tasks()[0].status == "Todo"
+
+
+def test_credentials_are_split_and_product_branch_and_contents_writes_denied(tmp_path, monkeypatch):
+    calls = []
+
+    def transport(token):
+        def request(method, path, data=None):
+            calls.append((token, method, path))
+            return {"private": True}
+        return request
+
+    monkeypatch.setattr("relay.github.transport", transport)
+    config = Config({}, set(), {}, "org/product", "org/manage", {})
+    with pytest.raises(ValueError):
+        GitHub(config, "same", tmp_path / "db", product_token="same")
+    svc = GitHub(config, "management", tmp_path / "db", product_token="product")
+    assert svc.is_private("org/manage") and svc.is_private("org/product")
+    svc.request("PUT", "/repos/org/manage/contents/.sprint-relay/tasks.json", {})
+    svc.request("POST", "/repos/org/product/issues", {})
+    for method, path in [("PUT", "/repos/org/product/contents/a.py"), ("GET", "/repos/org/other"),
+                         ("POST", "/repos/org/product/git/refs"), ("POST", "/graphql"),
+                         ("GET", "/repos/org/manage/contents/.env"),
+                         ("PUT", "/repos/org/manage/contents/.sprint-relay/../tool.py")]:
+        with pytest.raises(PermissionError):
+            svc.request(method, path)
+    assert [call[0] for call in calls] == ["management", "product", "management", "product"]
+
+
+def test_poll_and_calendar_cannot_bypass_pending_disclosure_review(service):
+    svc, api = service
+    # A legacy publication can have reserved two keys before either Issue POST.
+    with pytest.raises(TimeoutError):
+        api.lose_response = True
+        svc.publish([task("FIRST"), task("PRIVATE")])
+    svc.projection_allowed = lambda t: t.key != "PRIVATE"
+    svc.poll()
+    assert len(api.issues) == 1 and api.issues[1]["title"].startswith("[FIRST]")
+    pending = next(t for t in svc.list_tasks() if t.key == "PRIVATE")
+    changed = replace(pending, forecast_start="2030-01-01T12:00:00+00:00")
+    svc.publish_changes([], [(pending, changed)])
+    svc.update(replace(changed, priority=2), expected=changed)
+    assert len(api.issues) == 1
+    with pytest.raises(PermissionError):
+        svc.publish([task("FIRST"), task("PRIVATE")])
+    assert all("PRIVATE" not in issue["body"] for issue in api.issues.values())

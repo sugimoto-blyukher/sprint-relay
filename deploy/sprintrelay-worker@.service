@@ -1,0 +1,33 @@
+[Unit]
+Description=Isolated SprintRelay %i CLI gateway
+Requires=sprintrelay-worker@%i.socket
+
+[Service]
+User=sprintrelay-%i
+Group=sprintrelay-%i
+ExecStart=/opt/sprintrelay/.venv/bin/python -m relay.worker %i
+UMask=0077
+WorkingDirectory=/
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+# Bubblewrap needs unprivileged namespaces. The LXC host must support them.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# TLS to providers uses the host's dedicated CONNECT proxy at 127.0.0.1:3128.
+IPAddressDeny=any
+IPAddressAllow=localhost
+InaccessiblePaths=-/var/lib/sprintrelay -/etc/sprintrelay -/run/docker.sock -/run/containerd
+KillMode=control-group
+TasksMax=96
+MemoryMax=2G
+CPUQuota=150%
+TimeoutStopSec=8
+Restart=on-failure

@@ -1,7 +1,6 @@
 """Discord application commands and the single-instance polling loop."""
 
 import asyncio
-from collections import Counter
 from dataclasses import replace
 from functools import wraps
 from hashlib import sha256
@@ -12,9 +11,10 @@ import os
 from pathlib import Path
 import sqlite3
 from tempfile import NamedTemporaryFile
+from threading import RLock
 from typing import Literal
 
-from .discord_io import authorize, notice_batches, read_text
+from .discord_io import authorize, notice_batches, read_attachment, read_text
 from .schedule import Calendar, gantt, progress, recalculate
 
 
@@ -23,13 +23,14 @@ CALENDAR_KEYS = {"start", "end", "feature_freeze", "milestones", "availability",
 
 
 class Service:
-    def __init__(self, config, github, workflow, provider, db_path):
+    def __init__(self, config, github, workflow, control, db_path):
         self.config = config
         self.github = github
         self.workflow = workflow
-        self.provider = provider
+        self.control = control
         self.db_path = Path(db_path)
         self.calendar_path = self.db_path.with_suffix(".calendar.json")
+        self._schedule_lock = RLock()
         self.base_calendar = dict(config.calendar)
         self.config.calendar = self.calendar()
         self._validate_calendar(self.config.calendar)
@@ -64,14 +65,15 @@ class Service:
             raise ValueError("Calendar saved. Forecast synchronization is pending; use /schedule show to retry.") from exc
 
     def recalculate(self):
-        existing = self.github.tasks()
-        originals = {task.key: task for task in existing}
-        plan = recalculate(existing, replace(self.config, calendar=self.calendar()))
-        changed = [(originals[t.key], t) for t in plan.tasks if t != originals[t.key]]
-        if changed:
-            self.github.publish_changes([], changed)
-        self._alerts(plan)
-        return plan
+        with self._schedule_lock:
+            existing = self.github.tasks()
+            originals = {task.key: task for task in existing}
+            plan = recalculate(existing, replace(self.config, calendar=self.calendar()))
+            changed = [(originals[t.key], t) for t in plan.tasks if t != originals[t.key]]
+            if changed:
+                self.github.publish_changes([], changed)
+            self._alerts(plan)
+            return plan
 
     def _alerts(self, plan):
         by_key = {t.key: t for t in plan.tasks}
@@ -95,6 +97,10 @@ class Service:
                        (generation + 1, json.dumps(sorted(current))))
 
     def poll(self):
+        try:
+            self.workflow.recover()
+        except Exception as exc:
+            log.warning("Workflow recovery deferred (%s)", type(exc).__name__)
         self.github.poll()
         self.recalculate()
 
@@ -143,15 +149,18 @@ def create_client(service, *, worker=asyncio.to_thread):
     workflow, github = service.workflow, service.github
     config = service.config
 
-    def guarded(channel, *, approver=False):
+    def guarded(channel, *, approver=False, independent=False):
         def decorate(fn):
             @wraps(fn)
             async def perform(interaction, *args, **kwargs):
                 await interaction.response.defer(ephemeral=True, thinking=True)
                 try:
                     authorize(config, interaction, channel, approver=approver)
-                    async with lock:
+                    if independent or channel == "meetings":
                         await fn(interaction, *args, **kwargs)
+                    else:
+                        async with lock:
+                            await fn(interaction, *args, **kwargs)
                 except Exception as exc:
                     await _reply(interaction, _failure(exc))
             return perform
@@ -169,14 +178,23 @@ def create_client(service, *, worker=asyncio.to_thread):
         return json.loads(await read_text(attachment, extensions=(".json",))) if attachment else None
 
     async def send_notices():
-        channel = client.get_channel(int(config.channels["notifications"]))
-        if not channel or str(channel.guild.id) != config.guild_id:
-            raise RuntimeError("notifications channel unavailable")
         notices = await worker(github.notifications)
-        for ids, message in notice_batches(notices):
-            await channel.send(message)
-            for event_id in ids:
-                await worker(github.ack, event_id)
+        for name in ("notifications", "meetings"):
+            private = name == "meetings"
+            selected = [(key, text) for key, text in notices if key.startswith("workflow:") == private]
+            if not selected:
+                continue
+            channel = client.get_channel(int(config.channels[name]))
+            if not channel or str(channel.guild.id) != config.guild_id:
+                log.warning("Configured %s channel unavailable", name)
+                continue
+            if private and channel.permissions_for(channel.guild.default_role).view_channel:
+                log.warning("Private workflow notifications paused until meeting channel access is restricted")
+                continue
+            for ids, message in notice_batches(selected):
+                await channel.send(message)
+                for event_id in ids:
+                    await worker(github.ack, event_id)
 
     async def periodic():
         await client.wait_until_ready()
@@ -190,7 +208,7 @@ def create_client(service, *, worker=asyncio.to_thread):
                     await send_notices()
                 except Exception as exc:
                     log.warning("Notification delivery deferred (%s)", type(exc).__name__)
-            await asyncio.sleep(300)
+            await asyncio.sleep(config.github_sync.interval_seconds)
 
     def group(name, description):
         result = app_commands.Group(name=name, description=description)
@@ -203,16 +221,49 @@ def create_client(service, *, worker=asyncio.to_thread):
     schedule = group("schedule", "View or recalculate the team schedule")
     scope = group("scope", "Review changes to previously approved work")
 
-    @meeting.command(name="import", description="Import a transcript; enable consent only with every participant's agreement")
+    async def submit_meeting(interaction, source, text, attachment, consent, providers):
+        limit = config.privacy.max_input_bytes
+        body, attachment_hash = await read_attachment(attachment, limit=limit) if attachment else (text, None)
+        if not body or len(body.encode()) > limit:
+            raise ValueError(f"Provide a nonempty transcript of at most {limit} UTF-8 bytes.")
+        allowed = [name.strip() for name in providers.split(",") if name.strip()]
+        if bool(allowed) != consent or set(allowed) - {"muse", "claude_code", "codex", "antigravity"}:
+            raise ValueError("Name each consenting destination (muse, claude_code, codex, antigravity) and confirm consent, or leave both empty.")
+        actor = str(interaction.user.id)
+        meeting_id = await worker(
+            workflow.import_meeting, source, body, actor, consent, providers=allowed,
+            attachment_hash=attachment_hash,
+        )
+        current = await worker(workflow.show, meeting_id, actor)
+        job_id = current.get("job_id")
+        result = f"Meeting {meeting_id} · {current['state']}"
+        if job_id:
+            result += f" · Job {job_id}"
+        await _reply(interaction, result)
+
+    @meeting.command(name="import", description="Explicitly start a meeting workflow in the private channel")
+    @app_commands.describe(providers="Participant-approved destinations, comma-separated: muse, claude_code, codex, antigravity",
+                           consent="Every participant agreed to processing by those destinations")
     @guarded("meetings")
     async def import_meeting(interaction: discord.Interaction, text: str = "",
-                             attachment: discord.Attachment = None, consent: bool = False):
+                             attachment: discord.Attachment = None, consent: bool = False, providers: str = ""):
         if bool(text) == bool(attachment):
             raise ValueError("Provide exactly one transcript as text or a .md/.txt attachment.")
-        content = await read_text(attachment) if attachment else text
         source = f"discord:{interaction.guild_id}/{interaction.channel_id}/{interaction.id}"
-        mid = await worker(workflow.import_meeting, source, content, str(interaction.user.id), consent)
-        await _reply(interaction, f"Imported meeting {mid}.")
+        await submit_meeting(interaction, source, text, attachment, consent, providers)
+
+    @meeting.command(name="consent", description="Update participant-approved destinations or revoke access for an import")
+    @guarded("meetings", approver=True)
+    async def update_consent(interaction: discord.Interaction, meeting: str, providers: str,
+                             confirm_participant_consent: bool = False):
+        names = [] if providers.strip().lower() == "none" else [v.strip() for v in providers.split(",") if v.strip()]
+        if names and not confirm_participant_consent:
+            raise ValueError("Confirm every participant agreed to the listed destinations.")
+        job_id = await worker(workflow.set_providers, meeting, str(interaction.user.id), names)
+        message = "Meeting destinations updated." if names else "External processing permission revoked."
+        if job_id:
+            message += f" Job {job_id}."
+        await _reply(interaction, message)
 
     @tree.context_menu(name="Import transcript", guild=guild)
     async def import_message(interaction: discord.Interaction, message: discord.Message):
@@ -230,22 +281,26 @@ def create_client(service, *, worker=asyncio.to_thread):
                 placeholder="yes only with consent from all participants", max_length=3,
             )
 
-            async def on_submit(self, interaction):
-                await guarded("meetings")(save)(interaction, self.confirmation.value)
+            destinations = discord.ui.TextInput(
+                label="Participant-approved provider IDs", required=False, max_length=80,
+                placeholder="muse, claude_code, codex, antigravity",
+            )
 
-        async def save(interaction, answer):
+            async def on_submit(self, interaction):
+                await guarded("meetings")(save)(interaction, self.confirmation.value, self.destinations.value)
+
+        async def save(interaction, answer, destinations):
             if answer.lower() not in {"yes", "no"}:
                 raise ValueError("Enter yes or no for external AI consent.")
             if len(message.attachments) > 1:
                 raise ValueError("Select a message with at most one transcript attachment.")
-            body = await read_text(message.attachments[0]) if message.attachments else message.content
-            mid = await worker(workflow.import_meeting, message.jump_url, body,
-                                         str(interaction.user.id), answer.lower() == "yes")
-            await _reply(interaction, f"Imported meeting {mid}.")
+            await submit_meeting(interaction, message.jump_url, message.content,
+                                 message.attachments[0] if message.attachments else None,
+                                 answer.lower() == "yes", destinations)
 
         await interaction.response.send_modal(Consent())
 
-    @spec.command(description="Draft with your configured provider, or upload Markdown and minutes JSON")
+    @spec.command(description="Queue a draft or supply Markdown and minutes JSON")
     @guarded("meetings")
     async def draft(interaction: discord.Interaction, meeting: str, markdown: discord.Attachment = None,
                     minutes: discord.Attachment = None):
@@ -253,7 +308,10 @@ def create_client(service, *, worker=asyncio.to_thread):
         records = await attachment_json(minutes)
         digest = await worker(workflow.draft, meeting, str(interaction.user.id),
                                          markdown=body, minutes=records)
-        await _reply(interaction, f"Draft revision {digest}. Use /spec show to review.")
+        if body is None:
+            await _reply(interaction, f"Draft workflow accepted. Job {digest}.")
+        else:
+            await _reply(interaction, f"Draft revision {digest}. Use /spec show to review.")
 
     @spec.command(description="Read a revision, recorded decisions, diff and consistency report")
     @guarded("meetings")
@@ -263,6 +321,8 @@ def create_client(service, *, worker=asyncio.to_thread):
         if view == "review":
             await _reply(interaction, json.dumps(result, indent=2, ensure_ascii=False), filename="revision.json")
             return
+        if not result.get("digest"):
+            raise ValueError("The draft is still pending. Use the review view to see its status.")
         body = result["markdown"] if view == "markdown" else json.dumps(result["minutes"], indent=2, ensure_ascii=False)
         filename = "spec.md" if view == "markdown" else "minutes.json"
         await interaction.followup.send(f"Revision {result['digest']}",
@@ -275,7 +335,7 @@ def create_client(service, *, worker=asyncio.to_thread):
         body = await read_text(markdown)
         result = await worker(workflow.revise, meeting, str(interaction.user.id),
                                          body, reason, based_on=digest, minutes=await attachment_json(minutes))
-        await _reply(interaction, f"Revised to {result}. Validate this revision before approval.")
+        await _reply(interaction, f"Revised to {result}. Check validation status with /spec show.")
 
     @spec.command(name="validate", description="Run a consistency check or import an AI review JSON for this revision")
     @guarded("meetings")
@@ -283,7 +343,10 @@ def create_client(service, *, worker=asyncio.to_thread):
                             report: discord.Attachment = None):
         checked = await worker(workflow.validate, meeting, str(interaction.user.id),
                                           digest, report=await attachment_json(report))
-        await _reply(interaction, json.dumps(checked, indent=2, ensure_ascii=False), filename="review.json")
+        if isinstance(checked, str):
+            await _reply(interaction, f"Consistency check accepted. Job {checked}.")
+        else:
+            await _reply(interaction, json.dumps(checked, indent=2, ensure_ascii=False), filename="review.json")
 
     @spec.command(description="Approve a validated revision and publish its generated or uploaded tasks")
     @guarded("meetings", approver=True)
@@ -291,7 +354,10 @@ def create_client(service, *, worker=asyncio.to_thread):
                       tasks: discord.Attachment = None):
         result = await worker(workflow.approve, meeting, str(interaction.user.id),
                                          digest, tasks=await attachment_json(tasks))
-        await after_change(interaction, f"Approved {digest}.\n{_list_tasks(result)}")
+        if isinstance(result, str):
+            await _reply(interaction, f"Approved {digest}. Task planning job {result}.")
+        else:
+            await after_change(interaction, f"Approved {digest}.\n{_list_tasks(result)}")
 
     @scope.command(description="List changes that require a human decision")
     @guarded("meetings")
@@ -323,6 +389,26 @@ def create_client(service, *, worker=asyncio.to_thread):
                      action: Literal["claim", "start", "review", "reject", "done", "block", "unblock",
                                      "estimate", "link", "cancel"], value: str = None):
         await change_task(interaction, key, action, value)
+
+    @task.command(description="List tasks assigned to your Discord ID")
+    @guarded("tasks")
+    async def mine(interaction: discord.Interaction):
+        tasks = await worker(github.tasks)
+        await _reply(interaction, _list_tasks([t for t in tasks if t.assignee == str(interaction.user.id)]))
+
+    def add_task_shortcut(name, description):
+        @task.command(name=name, description=description)
+        @guarded("tasks")
+        async def shortcut(interaction: discord.Interaction, key: str, value: str = None):
+            await change_task(interaction, key, name, value)
+
+    for name, description in {
+        "claim": "Claim a design task", "start": "Start an assigned task",
+        "review": "Request review with a deliverable URL", "done": "Accept completed work with evidence",
+        "block": "Record a blocker and reason", "unblock": "Clear a blocker",
+        "estimate": "Set remaining hours or unknown",
+    }.items():
+        add_task_shortcut(name, description)
 
     class ValueModal(discord.ui.Modal):
         def __init__(self, key, action, label):
@@ -395,6 +481,19 @@ def create_client(service, *, worker=asyncio.to_thread):
         else:
             await _reply(interaction, progress(plan), filename="forecast.txt")
 
+    @schedule.command(name="recalculate", description="Recalculate the calendar forecast and display risks")
+    @guarded("tasks")
+    async def recalculate_schedule(interaction: discord.Interaction):
+        plan = await worker(service.recalculate)
+        await _reply(interaction, progress(plan), filename="forecast.txt")
+
+    @schedule.command(description="Show dependency-only critical paths and duration")
+    @guarded("tasks")
+    async def critical(interaction: discord.Interaction):
+        plan = await worker(service.recalculate)
+        paths = "\n".join(" → ".join(path) for path in plan.critical_paths)
+        await _reply(interaction, f"Dependency-only duration: {plan.duration_hours} h\n{paths or 'No known critical path.'}")
+
     @schedule.command(description="View the effective calendar for edits")
     @guarded("tasks")
     async def settings(interaction: discord.Interaction):
@@ -408,25 +507,47 @@ def create_client(service, *, worker=asyncio.to_thread):
         plan = await worker(service.update_calendar, data)
         await _reply(interaction, progress(plan), filename="forecast.txt")
 
-    @tree.command(name="progress", description="Team progress; optionally summarize aggregate counts with AI", guild=guild)
+    @tree.command(name="progress", description="Show computed team progress, risks and remaining effort", guild=guild)
     @guarded("tasks")
-    async def progress_report(interaction: discord.Interaction, ai_consent: bool = False):
+    async def progress_report(interaction: discord.Interaction):
         plan = await worker(service.recalculate)
-        report = progress(plan)
-        if ai_consent:
-            if str(interaction.user.id) not in config.approvers:
-                raise PermissionError("An approver must confirm participant consent for AI summaries.")
-            counts = dict(Counter(t.status for t in plan.tasks))
-            try:
-                summary = await worker(service.provider.summary, json.dumps({"status_counts": counts}))
-                report += "\nAI commentary on status counts:\n" + summary
-            except Exception:
-                report += "\nAI summary unavailable."
-        await _reply(interaction, report, filename="progress.txt")
+        await _reply(interaction, progress(plan), filename="progress.txt")
+
+    relay = group("relay", "Monitor providers, jobs and patrols")
+
+    @relay.command(description="Show active providers, last and next patrol, and degraded status")
+    @guarded("tasks", independent=True)
+    async def status(interaction: discord.Interaction):
+        result = await worker(service.control.status)
+        await _reply(interaction, json.dumps(result, indent=2, ensure_ascii=False), filename="status.json")
+
+    @relay.command(name="jobs", description="Show workflow and audit job summaries")
+    @guarded("tasks", independent=True)
+    async def jobs(interaction: discord.Interaction):
+        result = await worker(service.control.jobs)
+        await _reply(interaction, json.dumps(result, indent=2, ensure_ascii=False), filename="jobs.json")
+
+    @relay.command(description="Pause agent processing; human task actions stay available")
+    @guarded("tasks", approver=True, independent=True)
+    async def pause(interaction: discord.Interaction):
+        await worker(service.control.pause, str(interaction.user.id))
+        await _reply(interaction, "Agent processing paused.")
+
+    @relay.command(description="Resume agent processing after an operator pause")
+    @guarded("tasks", approver=True, independent=True)
+    async def resume(interaction: discord.Interaction):
+        await worker(service.control.resume, str(interaction.user.id))
+        await _reply(interaction, "Agent processing resumed.")
+
+    @relay.command(description="Request an exceptional patrol for operator verification")
+    @guarded("tasks", approver=True, independent=True)
+    async def patrol(interaction: discord.Interaction):
+        receipt = await worker(service.control.patrol, str(interaction.user.id))
+        await _reply(interaction, f"Patrol request: {receipt}")
 
     client.command_tree = tree
     return client
 
 
-def run(config, token, github, workflow, provider, db_path):
-    create_client(Service(config, github, workflow, provider, db_path)).run(token)
+def run(config, token, github, workflow, control, db_path):
+    create_client(Service(config, github, workflow, control, db_path)).run(token)
