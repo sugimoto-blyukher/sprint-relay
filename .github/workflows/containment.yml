@@ -52,3 +52,28 @@ jobs:
           if len(cases) != 1 or any(cases[0].find(tag) is not None for tag in ("skipped", "failure", "error")):
               raise SystemExit("The worker kernel isolation check did not pass on this runner.")
           PY
+      - name: Run the native fixture under the production service restrictions
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          fixture=$(sudo mktemp -d /var/lib/sprintrelay-fixture.XXXXXXXX)
+          sudo chown "$(id -u):$(id -g)" "$fixture"
+          cp -a relay tests pyproject.toml "$fixture/"
+          python -m venv "$fixture/venv"
+          "$fixture/venv/bin/python" -m pip install "$fixture[test]"
+          # Bind the test's process to the shipped restrictions. Identity and
+          # activation/exec/lifecycle belong to the fixture, not the real Worker.
+          properties=()
+          while IFS= read -r setting; do
+            properties+=("--property=$setting")
+          done < <(sed -n '/^\[Service\]$/,/^\[/p' deploy/sprintrelay-worker@.service |
+            sed -n -E '/^[A-Za-z]+=/p' |
+            sed -E '/^(User|Group|ExecStart|Restart|RestartSec)=/d')
+          sudo systemd-run --wait --pipe --collect --uid="$(id -u)" --gid="$(id -g)" \
+            "${properties[@]}" /usr/bin/bash -ec '
+              cd "$1"
+              report=$(mktemp /tmp/sprintrelay-test.XXXXXXXX)
+              venv/bin/python -m pytest -q tests/test_worker.py::test_a13_kernel_mount_boundary_when_namespaces_are_available --junitxml="$report"
+              venv/bin/python -c "import sys; from xml.etree import ElementTree as E; cases=E.parse(sys.argv[1]).findall(\".//testcase\"); assert len(cases)==1 and len(cases[0])==0, \"systemd isolation check must execute and pass\"" "$report"
+            ' bash "$fixture"

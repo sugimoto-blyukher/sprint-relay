@@ -35,7 +35,7 @@ def test_a13_mounts_and_environment_exclude_repository_and_parent_secrets(tmp_pa
     assert "--disable-userns" in argv and "--bind" not in argv
     assert str(secret) in argv and str(account) not in argv
     assert all(path not in argv for path in ("/usr", "/home", "/var/run/docker.sock", "/workspace"))
-    assert argv[-4:] == ["--remount-ro", "/", "--", "/bin/agent"]
+    assert argv[-6:] == ["--remount-ro", "/proc", "--remount-ro", "/", "--", "/bin/agent"]
     assert "must-stay-in-core" not in worker._agent_env().values()
     assert set(worker._agent_env()) == {"HOME", "PATH", "LANG", "TMPDIR", "HTTPS_PROXY", "NO_PROXY"}
     secret.chmod(0o644)
@@ -134,19 +134,23 @@ def test_classified_diagnostics_no_raw_output(err, code):
     assert worker._failure(err) == code
 
 
-def test_a08_stdout_cannot_satisfy_watchdog():
+def test_a08_stdout_cannot_satisfy_watchdog(caplog):
     from relay.watchdog import Watchdog
 
     store = Mock()
     store.get.return_value = {"state": "RUNNING"}
+    store.config.jobs.probe_diagnostics = True
     dispatch = AsyncMock(return_value=None)
     async def local_call(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
     watchdog = Watchdog(store, "demo", dispatch=dispatch, worker=local_call)
-    asyncio.run(watchdog._execute({"id": 8, "provider": "codex", "lease_token": "test-lease"}))
+    asyncio.run(watchdog._execute({"id": "a" * 32, "provider": "codex", "role": "management",
+                                   "kind": "probe", "lease_token": "test-lease"}))
     args, kwargs = store.fail.call_args
-    assert args == (8, "codex", "test-lease", "FORMAT")
+    assert args == ("a" * 32, "codex", "test-lease", "FORMAT")
+    assert "CLI_EXITED_WITHOUT_MCP_COMPLETION" in caplog.text
+    assert "test-lease" not in caplog.text
 
 
 def audit_snapshot():
@@ -202,6 +206,8 @@ int main(int argc, char **argv) {
     struct statvfs fs;
     if (statvfs("/work", &fs) != 0 || !(fs.f_flag & ST_RDONLY)) return 3;
     if (open("/work/edit", O_CREAT|O_WRONLY, 0600) >= 0) return 3;
+    if (statvfs("/proc", &fs) != 0 || !(fs.f_flag & ST_RDONLY)) return 10;
+    if (access("/sys", F_OK) == 0) return 11;
     if (open("/session/.codex/auth.json", O_WRONLY) >= 0) return 4;
     const char *file = "/evidence/context.json";
     struct stat info;
@@ -242,3 +248,31 @@ int main(int argc, char **argv) {
     with worker._mount_snapshot(worker._isolate("codex"), snapshot) as (cmd, fds):
         actual = subprocess.run(cmd, env=worker._agent_env(), capture_output=True, timeout=5, pass_fds=fds)
     assert actual.returncode == 0, actual.stderr.decode()
+
+
+@pytest.mark.parametrize(("invoke_result", "expected", "code"), [
+    ([(2, b"", b"bwrap: fixture SECRET_PAYLOAD")], "CAPABILITY", "BWRAP_START_FAILED"),
+    ([(0, b"wrong version SECRET_PAYLOAD", b"")], "CAPABILITY", "VERSION_MISMATCH"),
+    ([(0, b"fixture", b""), (1, b"", b"SECRET_PAYLOAD")], "AUTH", "ACCOUNT_AUTH_FAILED"),
+    ([(0, b"fixture", b""), (0, b"", b"Logged in using ChatGPT"),
+      (2, b"", b"unexpected argument SECRET_PAYLOAD")], "CAPABILITY", "CLI_CONFIG_INCOMPATIBLE"),
+    ([(0, b"fixture", b""), (0, b"", b"Logged in using ChatGPT"),
+      (1, b"", b"MCP startup sprintrelay: failed to list tools SECRET_PAYLOAD")], "TRANSIENT", "MCP_CLIENT_LIST_FAILED"),
+    ([FileNotFoundError("SECRET_PAYLOAD")], "UNAVAILABLE", "BINARY_START_FAILED"),
+    ([TimeoutError("SECRET_PAYLOAD")], "TIMEOUT", "TIMEOUT"),
+])
+def test_probe_diagnostics_are_scoped_and_redacted(tmp_path, monkeypatch, caplog, invoke_result, expected, code):
+    root = tmp_path / "codex"
+    root.mkdir()
+    (root / "version").write_text("fixture")
+    monkeypatch.setattr(worker, "INSTALL_DIR", tmp_path)
+    monkeypatch.setattr(worker, "_trusted", lambda path: None)
+    monkeypatch.setattr(worker, "_isolate", lambda provider, bindings: ["fake-namespace", "/bin/agent"])
+    monkeypatch.setattr(worker, "_invoke", AsyncMock(side_effect=invoke_result))
+    req = request(job_id="a" * 32, probe=True, diagnose=True)
+    assert asyncio.run(worker._execute("codex", req)) == expected
+    assert f"code={code} job={req.job_id} provider=codex role=audit" in caplog.text
+    assert "SECRET_PAYLOAD" not in caplog.text and req.token not in caplog.text
+    assert "mcp_servers.sprintrelay.required=true" in worker._arguments("codex", req)
+    with pytest.raises(ValidationError):
+        request(diagnose=True)

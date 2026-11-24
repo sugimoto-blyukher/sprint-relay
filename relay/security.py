@@ -20,6 +20,8 @@ class Principal:
     project: str
     job_id: str | None = None
     lease_token: str | None = field(default=None, repr=False, compare=False)
+    synthetic_probe: bool = False
+    diagnose: bool = False
 
 
 class TokenVault:
@@ -31,6 +33,8 @@ class TokenVault:
         self._lock = threading.Lock()
 
     def issue(self, principal: Principal, ttl: int = 600, *, lease_token: str) -> str:
+        if principal.diagnose and not principal.synthetic_probe:
+            raise ValueError("Diagnostics require a synthetic probe")
         if not principal.job_id or not lease_token or not 1 <= ttl <= 3600:
             raise ValueError("Local access requires a bounded lifetime and a specific leased job")
         if principal.role not in {"management", "audit"} or not principal.subject:
@@ -53,6 +57,11 @@ class TokenVault:
                 return principal
             self._tokens.pop(self._hash(token), None)
             return None
+
+    def diagnostic_active(self):
+        with self._lock:
+            now = self.clock()
+            return any(expiry > now and p.diagnose for expiry, p in self._tokens.values())
 
     def revoke(self, token: str):
         with self._lock:

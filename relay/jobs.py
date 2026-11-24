@@ -60,11 +60,12 @@ AUDIT_OPERATIONS = frozenset("""
     get_tasks get_schedule get_progress request_audit get_audit_status get_audit_context submit_audit_result
     get_audit_result propose_or_create_issue post_review_comment update_task_priority publish_patrol_report
     complete_patrol report_job_failure unknown_tool pause resume patrol_requested claim finish
-    provider_unavailable provider_recovered
+    provider_unavailable provider_recovered probe_retry
 """.split())
 AUDIT_OUTCOMES = {"allowed", "denied", "invalid", "retry", "conflict", "failed", "stale",
                   "success", "FAILED", "RETRY_WAIT", "CANCELLED", "COMPLETED"} | ERRORS
 ACTIVE = ("PENDING", "RETRY_WAIT", "RUNNING")
+RETRYABLE_LOCAL_PROBE_ERRORS = {"CAPABILITY", "FORMAT", "UNTESTED"}
 ROLE_KINDS = {
     "management": {"minutes", "specification", "validation", "task_plan", "patrol", "probe"},
     "audit": {"audit", "probe"},
@@ -206,7 +207,9 @@ class JobStore:
                 continue
             health = self._ill(db, provider, role)
             if job["kind"] == "probe":
-                if provider in job["providers"] and health and max(h["retry_at"] for h in health) <= self.clock():
+                explicit = job["payload"].get("operator_retry") is True
+                if (provider in job["providers"] and (health or explicit)
+                        and all(self._probe_ready(h, explicit) for h in health)):
                     return provider
                 continue
             if provider not in self.config.privacy.project_providers:
@@ -496,6 +499,59 @@ class JobStore:
             row = db.execute("SELECT checkpoint FROM patrol_slots WHERE project=?", (project,)).fetchone()
             return json.loads(row[0]) if row and row[0] else None
 
+    def _probe_ready(self, health, explicit=False):
+        return health["retry_at"] <= self.clock() or (
+            explicit and health["role"] != "*" and health["reason"] in RETRYABLE_LOCAL_PROBE_ERRORS
+        )
+
+    def _active_probe(self, db, project, provider, role):
+        for row in db.execute("""SELECT * FROM jobs WHERE project=? AND kind='probe' AND role=?
+                AND state IN ('PENDING','RETRY_WAIT','RUNNING')""", (project, role)):
+            job = self._job(row)
+            if job["providers"] == [provider]:
+                return job
+        return None
+
+    def retry_probe(self, project, provider, role, *, actor):
+        """Request a synthetic check without changing health or replacing a lease."""
+        if project != self.config.management_repo or str(actor) not in self.config.approvers:
+            raise PermissionError("Configured human administrator required")
+        if provider == "muse" or role not in (None, "management", "audit"):
+            raise ValueError("Choose a local CLI provider and a supported role")
+        roles = [r for r in (("management", "audit") if role is None else (role,))
+                 if self._configured(provider, r, probe=True)]
+        if not roles:
+            raise ValueError("Provider and role must be enabled with terms confirmed")
+        receipts = []
+        with self.transaction() as db:
+            if self._paused(db, project):
+                raise ValueError("Resume the watchdog before requesting a probe")
+            for current_role in roles:
+                job = self._active_probe(db, project, provider, current_role)
+                waits = [h["retry_at"] for h in self._ill(db, provider, current_role)
+                         if not self._probe_ready(h, explicit=True)]
+                if job and job["state"] == "RUNNING":
+                    state, job_id = "running", job["id"]
+                elif waits:
+                    state, job_id = "cooldown", job["id"] if job else None
+                elif job:
+                    state, job_id = "already_queued", job["id"]
+                    payload = job["payload"] | {"operator_retry": True}
+                    db.execute("UPDATE jobs SET payload=? WHERE id=?", (_json(payload), job_id))
+                else:
+                    state = "queued"
+                    job_id = self.enqueue(project, "probe", current_role,
+                                          "operator-probe:" + secrets.token_hex(16),
+                                          {"challenge": secrets.token_hex(16), "operator_retry": True},
+                                          [provider], db=db, priority=-1000)
+                self.audit(project, actor, provider, job_id, "probe_retry",
+                           "retry" if state == "cooldown" else "success", db=db)
+                receipt = {"role": current_role, "state": state, "job_id": job_id}
+                if state == "cooldown":
+                    receipt["retry_at"] = max(waits)
+                receipts.append(receipt)
+        return receipts
+
     def maintenance(self, project):
         """Fence expired leases, detect missing Muse and schedule bounded recovery probes."""
         now = self.clock()
@@ -539,12 +595,12 @@ class JobStore:
                     key = f"probe:{provider}:{role}:{row['retry_at']}"
                     existing = db.execute("SELECT id FROM jobs WHERE project=? AND kind='probe' AND idem=?",
                                           (project, key)).fetchone()
-                    if not existing:
+                    if not existing and not self._active_probe(db, project, provider, role):
                         self.enqueue(project, "probe", role, key, {"challenge": secrets.token_hex(16)},
                                      [provider], db=db, priority=-1000)
                     break
 
-    def dispatchable(self, project):
+    def dispatchable(self, project, *, busy_providers=()):
         with self.transaction() as db:
             jobs = db.execute("""SELECT * FROM jobs WHERE project=? AND role!='system'
                 AND state IN ('PENDING','RETRY_WAIT') AND next_attempt_at<=?
@@ -553,7 +609,7 @@ class JobStore:
             for row in jobs:
                 job = self._job(row)
                 provider = self._route(db, job)
-                if provider and provider != "muse" and self._available(db, job, provider):
+                if provider and provider != "muse" and provider not in busy_providers and self._available(db, job, provider):
                     claims.append(self._claim(db, job, provider))
             return claims
 

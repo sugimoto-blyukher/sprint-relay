@@ -35,6 +35,7 @@ class WatchdogSettings(Settings):
 
 
 class JobSettings(Settings):
+    probe_diagnostics: bool = False
     timeout_seconds: int = Field(default=600, ge=10, le=3600)
     max_retries: int = Field(default=1, ge=0, le=5)
     max_audit_concurrency: Literal[1] = 1

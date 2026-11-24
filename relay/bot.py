@@ -545,6 +545,20 @@ def create_client(service, *, worker=asyncio.to_thread):
         receipt = await worker(service.control.patrol, str(interaction.user.id))
         await _reply(interaction, f"Patrol request: {receipt}")
 
+    @relay.command(description="Request a synthetic CLI probe without resetting provider limits")
+    @guarded("tasks", approver=True, independent=True)
+    async def retry(interaction: discord.Interaction, provider: Literal["codex", "claude_code", "antigravity"],
+                    role: Literal["management", "audit"] | None = None):
+        receipts = await worker(service.control.retry, str(interaction.user.id), provider, role)
+        lines = []
+        for item in receipts:
+            if item["state"] == "cooldown":
+                detail = f"cooldown until <t:{int(item['retry_at'])}:F>"
+            else:
+                detail = f"{item['state']} · job {item['job_id']}"
+            lines.append(f"{provider} / {item['role']}: {detail}")
+        await _reply(interaction, "\n".join(lines))
+
     client.command_tree = tree
     return client
 

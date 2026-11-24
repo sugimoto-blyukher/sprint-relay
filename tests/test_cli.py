@@ -129,9 +129,13 @@ def test_core_uses_same_database_and_separate_mcp_listeners(tmp_path, monkeypatc
         return lambda scope, receive, send: None
 
     class FakeListener:
+        started = False
+
         def __init__(self, config):
             listeners.append(config)
+
         async def serve(self):
+            self.started = True
             await asyncio.Event().wait()
 
     async def start(token):
@@ -151,6 +155,8 @@ def test_core_uses_same_database_and_separate_mcp_listeners(tmp_path, monkeypatc
         assert identity.project == cfg.management_repo and identity.job_id == "probe-1"
         assert identity.lease_token == "fixture-lease" and identity.role == "audit"
         assert provider == "codex" and kwargs["snapshot"] is None
+        assert identity.synthetic_probe and kwargs["probe"] is True
+        assert not identity.diagnose and kwargs["diagnose"] is False
         return None
 
     monkeypatch.setattr("relay.worker.run_cli", create_autospec(run_cli, side_effect=isolated_launch))
