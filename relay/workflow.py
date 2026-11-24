@@ -128,6 +128,11 @@ def migrate_workflow(db, project=None):
     db.execute("""CREATE TABLE IF NOT EXISTS workflow_approval (
         digest TEXT PRIMARY KEY, project TEXT NOT NULL, meeting TEXT NOT NULL,
         report_hash TEXT NOT NULL, actor TEXT NOT NULL, approved_at TEXT)""")
+    columns = {column[1] for column in db.execute("PRAGMA table_info(workflow_approval)")}
+    if "forced" not in columns:
+        db.execute("ALTER TABLE workflow_approval ADD COLUMN forced INTEGER NOT NULL DEFAULT 0 CHECK(forced IN (0,1))")
+        db.execute("""ALTER TABLE workflow_approval ADD COLUMN reason TEXT
+            CHECK ((forced=0 AND reason IS NULL) OR (forced=1 AND reason IS NOT NULL AND length(trim(reason))>0))""")
     db.execute("""CREATE TABLE IF NOT EXISTS workflow_public_release (
         digest TEXT PRIMARY KEY, project TEXT NOT NULL, meeting TEXT NOT NULL,
         plan_hash TEXT NOT NULL, actor TEXT NOT NULL, recorded_at TEXT NOT NULL)""")
@@ -162,7 +167,7 @@ def migrate_workflow(db, project=None):
             db.execute("""INSERT INTO workflow_v2(meeting,project,state,providers,input_hash,imported_at)
                           VALUES(?,?,?,'[]',?,?)""",
                        (row["id"], project, state, _digest(row["transcript"]), LEGACY_DATE))
-        db.execute("""INSERT OR IGNORE INTO workflow_approval
+        db.execute("""INSERT OR IGNORE INTO workflow_approval(digest,project,meeting,report_hash,actor,approved_at)
             SELECT r.digest,v.project,r.meeting_id,'',r.approved_by,NULL FROM revision r
             JOIN workflow_v2 v ON r.meeting_id=v.meeting WHERE r.approved_by IS NOT NULL""")
         for row in db.execute("""SELECT r.digest,r.report FROM revision r JOIN workflow_approval a
@@ -218,13 +223,14 @@ class Workflow:
             raise ValueError("Operation requires the current revision")
         return self._revision(db, digest)
 
-    def _state(self, db, key, state, job_id=None):
+    def _state(self, db, key, state, job_id=None, *, forced=False):
         db.execute("UPDATE workflow_v2 SET state=?,job_id=? WHERE meeting=? AND project=?",
                    (state, job_id, key, self.project))
         head = self._meeting(db, key)["head"]
         notice = "workflow:" + _digest(self.project, key, head, state, job_id)
+        label = "FORCE-APPROVED" if forced else state
         db.execute("INSERT OR IGNORE INTO workflow_notice VALUES(?,?,?)",
-                   (notice, self.project, f"Meeting {key} · {state}" + (f" · job {job_id}" if job_id else "")))
+                   (notice, self.project, f"Meeting {key} · {label}" + (f" · job {job_id}" if job_id else "")))
 
     def _supersede(self, db, row):
         if self.jobs and row["job_id"]:
@@ -396,7 +402,7 @@ class Workflow:
             if rev["meeting_id"] != meeting:
                 raise ValueError("Revision belongs to another meeting")
             previous = self._revision(db, rev["parent"])["markdown"] if rev["parent"] else ""
-            approval = db.execute("SELECT * FROM workflow_approval WHERE digest=?", (rev["digest"],)).fetchone()
+            approval = self._receipt(db, rev["meeting_id"], rev["digest"])
             if (row["state"] == "PUBLISHING" and row["agent_plan"] and rev["digest"] == row["head"]
                     and str(actor) in self.config.approvers):
                 plan = json.loads(rev["plan"])
@@ -405,7 +411,7 @@ class Workflow:
             return {**output, "digest": rev["digest"], "parent": rev["parent"],
                     "markdown": rev["markdown"], "minutes": json.loads(rev["minutes"]),
                     "actor": rev["actor"], "reason": rev["reason"], "approved_by": rev["approved_by"],
-                    "approval": dict(approval) if approval else None,
+                    "approval": {**dict(approval), "forced": bool(approval["forced"])} if approval else None,
                     "report": json.loads(rev["report"]) if rev["report"] else None,
                     "diff": "".join(difflib.unified_diff(previous.splitlines(True),
                                                         rev["markdown"].splitlines(True)))}
@@ -458,8 +464,6 @@ class Workflow:
         return tasks
 
     def _prepare_plan(self, db, row, rev, tasks, *, agent):
-        if row["state"] not in ("VALIDATED", "PLANNING", "APPROVED"):
-            raise ValueError("Task plan requires the current validated revision")
         data = tasks
         if agent:
             data = TaskPlan.model_validate({"tasks": tasks}).model_dump(exclude_none=True)["tasks"]
@@ -509,24 +513,76 @@ class Workflow:
         db.execute("UPDATE workflow_v2 SET agent_plan=? WHERE meeting=?", (bool(agent), row["id"]))
         self._state(db, row["id"], "PUBLISHING")
 
-    def approve(self, meeting, actor, digest, *, tasks=None):
+    def _receipt(self, db, meeting, digest):
+        return db.execute("""SELECT * FROM workflow_approval WHERE digest=? AND meeting=? AND project=?""",
+                          (digest, meeting, self.project)).fetchone()
+
+    def approval_is_forced(self, meeting, actor, digest):
+        self._member(actor)
+        with private_db(self.path) as db:
+            receipt = self._receipt(db, meeting, digest)
+            return bool(receipt and receipt["forced"])
+
+    def _approved_receipt(self, db, rev, report):
+        receipt = self._receipt(db, rev["meeting_id"], rev["digest"])
+        if (not receipt or receipt["actor"] != rev["approved_by"] or not report or
+                receipt["report_hash"] != _digest(report) or
+                (report["blocking_questions"] and not receipt["forced"])):
+            raise ValueError("Approval must match the recorded decision and validation report")
+        return receipt
+
+    def _check_approval(self, db, row, rev, force):
+        report = json.loads(rev["report"]) if rev["report"] else None
+        if not report:
+            raise ValueError("Approval requires validation of the current revision")
+        if row["state"] == "NEEDS_REVISION":
+            # _record_review only accepts a human-revised head and records its reviewer.
+            if (force and rev["parent"] and rev["reviewer"] and not rev["approved_by"] and
+                    report.get("revision") == rev["digest"] and report["blocking_questions"]):
+                return
+            raise ValueError("Resolve blocking questions and validate before approval")
+        if row["state"] not in ("VALIDATED", "APPROVED", "PLANNING", "PUBLISHING", "PUBLISHED"):
+            raise ValueError("Approval requires validation of the current revision")
+        if rev["approved_by"]:
+            receipt = self._approved_receipt(db, rev, report)
+            if not force or receipt["forced"]:
+                return
+        if force:
+            raise ValueError("Forced approval requires unresolved findings on this validated revision")
+        if report["blocking_questions"]:
+            raise ValueError("Resolve blocking questions and validate before approval")
+
+    def approve(self, meeting, actor, digest, *, tasks=None, force=False, reason=None):
         self._approver(actor)
+        if type(force) is not bool:
+            raise ValueError("force must be a boolean")
+        if force:
+            reason = _text(reason, "forced approval reason").strip()
         with self.lock:
             with private_db(self.path) as db:
                 row = self._meeting(db, meeting)
                 rev = self._head(db, row, digest)
                 if row["published"] == digest:
+                    if force:
+                        self._check_approval(db, row, rev, force)
                     return self._published(rev)
                 prepared = None
                 if tasks is not None and not rev["plan"]:
+                    self._check_approval(db, row, rev, force)
                     prepared = self._prepare_plan(db, row, rev, tasks, agent=False)
                 db.execute("BEGIN IMMEDIATE")
                 row = self._meeting(db, meeting)
                 rev = self._head(db, row, digest)
-                if row["state"] not in ("VALIDATED", "APPROVED", "PLANNING", "PUBLISHING", "PUBLISHED"):
-                    raise ValueError("Approval requires validation of the current revision")
-                if not rev["report"] or json.loads(rev["report"])["blocking_questions"]:
-                    raise ValueError("Resolve blocking questions and validate before approval")
+                self._check_approval(db, row, rev, force)
+                if not rev["approved_by"]:
+                    db.execute("UPDATE revision SET approved_by=? WHERE digest=?", (str(actor), digest))
+                    db.execute("""INSERT INTO workflow_approval
+                        (digest,project,meeting,report_hash,actor,approved_at,forced,reason) VALUES(?,?,?,?,?,?,?,?)""",
+                               (digest, self.project, meeting, _digest(json.loads(rev["report"])),
+                                str(actor), _now(), force, reason if force else None))
+                    if force or tasks is None:
+                        self._state(db, meeting, "APPROVED", forced=force)
+                        row = self._meeting(db, meeting)
                 if isinstance(tasks, dict):
                     if (set(tasks) != {"confirm_public_release", "plan_hash"} or
                             tasks["confirm_public_release"] is not True or not row["agent_plan"] or
@@ -538,13 +594,7 @@ class Workflow:
                 if tasks is not None and not rev["plan"]:
                     self._supersede(db, row)
                     self._stage_plan(db, row, rev, tasks, prepared, agent=False)
-                if not rev["approved_by"]:
-                    db.execute("UPDATE revision SET approved_by=? WHERE digest=?", (str(actor), digest))
-                    db.execute("""INSERT INTO workflow_approval VALUES(?,?,?,?,?,?)""",
-                               (digest, self.project, meeting, _digest(json.loads(rev["report"])), str(actor), _now()))
                 if tasks is None and not rev["plan"]:
-                    if not rev["approved_by"]:
-                        self._state(db, meeting, "APPROVED")
                     job = self._queue(db, row, "task_plan")
                     return job or f"manual:{meeting}:{digest}"
             return self._publish(meeting, digest)
@@ -561,11 +611,9 @@ class Workflow:
             rev = self._head(db, row, digest)
             if row["state"] == "PUBLISHED":
                 return self._published(rev)
-            approval = db.execute("SELECT * FROM workflow_approval WHERE digest=? AND meeting=? AND project=?",
-                                  (digest, meeting, self.project)).fetchone()
-            if (row["state"] != "PUBLISHING" or not rev["plan"] or not approval or
-                    approval["report_hash"] != _digest(json.loads(rev["report"]))):
+            if row["state"] != "PUBLISHING" or not rev["plan"]:
                 raise ValueError("Publication requires a plan bound to the approved validation")
+            self._approved_receipt(db, rev, json.loads(rev["report"]) if rev["report"] else None)
             old = self._revision(db, row["published"]) if row["published"] else None
             cleared = self._public_release(db, rev)
         plan = [Task.from_dict(item) for item in json.loads(rev["plan"])]
@@ -659,6 +707,12 @@ class Workflow:
                 return {**result, "minutes": json.loads(row["extraction"])}
             rev = self._head(db, row, row["head"])
             result.update(markdown=rev["markdown"], minutes=json.loads(rev["minutes"]))
+            if job["kind"] == "task_plan":
+                report = json.loads(rev["report"]) if rev["report"] else None
+                receipt = self._approved_receipt(db, rev, report)
+                if receipt["forced"]:
+                    result["approval"] = {"forced": True, "reason": receipt["reason"],
+                                          "blocking_questions": report["blocking_questions"]}
             if row["audit_result"] and job["kind"] == "validation":
                 result["audit_result"] = json.loads(row["audit_result"])
             return result

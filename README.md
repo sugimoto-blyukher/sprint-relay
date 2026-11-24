@@ -30,6 +30,8 @@ python -m pytest -q
 4. 会議チャンネルで `/meeting import` を実行します。仕様が届いたら人が `/spec revise` で査読結果を登録し、同じ digest の整合性検証が通った版を `/spec approve` で承認します。外部 AI を利用できないときは手動ファイルと、対象版の実際の AI チェック結果を入力できます。[Discord 操作](docs/discord.md) · [承認・手動運用](docs/workflow.md)
 5. タスク開始・レビュー・受け入れは Discord または Issue コメントから実行します。`/schedule show` で予測・ガント、`/progress` で残工数・ブロッカーを表示し、`/relay status` と `/relay jobs` で巡回・処理状況を確認します。
 
+検証済みの版に未解決の指摘が残った場合、承認者はレポートと diff を確認し、`/spec approve meeting:<ID> digest:<digest> force:true reason:<残存リスクを受け入れる理由>` で進められます。未解決事項を受け入れる責任は承認者にあります。指摘と理由は版ごとに保存され、`/spec show view:review` で確認できます。データ提供の同意、計画の検証、公開リポジトリへの公開確認は引き続き必要です。 [強制承認の運用手順](docs/workflow.md#未解決の指摘を受け入れる場合)
+
 ## 状態と権限
 
 GitHub の `.sprint-relay/tasks.json` と `.sprint-relay/specs/` が公開済み状態の正本です。SQLite には版の履歴、同意、ジョブ・リース・チェックポイント、発行や通知の途中状態を保存します。同じジョブを再試行しても Issue を重複発行しないよう、GitHub 側のマーカーと台帳を照合します。Discord 通知は送信直後の異常終了で再配信されることがあります。

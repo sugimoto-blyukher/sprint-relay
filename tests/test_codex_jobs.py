@@ -24,7 +24,11 @@ TASK = dict(key="DESIGN", title="Prototype", description="Prepare prototype", ro
             acceptance=["Prototype opens"])
 
 
-def project_calls(kind, project):
+OPEN_QUESTION = "PRIVATE_QUESTION about a future layout"
+RISK_REASON = "PRIVATE_REASON accepted for the prototype"
+
+
+def project_calls(kind, project, forced):
     """The next call uses only input or results actually returned to the model."""
     ctx = yield "get_project_context", {"project_id": project}
     assert ctx["job"]["kind"] == kind and "probe" not in ctx
@@ -63,14 +67,17 @@ def project_calls(kind, project):
         if kind == "specification":
             yield "submit_specification", args | {"markdown": SPEC, "evidence": [TRANSCRIPT]}
         elif kind == "validation":
-            yield "submit_validation", args | dict(digest=record["digest"], blocking_questions=[],
+            yield "submit_validation", args | dict(digest=record["digest"], blocking_questions=[OPEN_QUESTION] if forced else [],
                                                    checks={name: "Checked prototype" for name in CHECKS})
         elif kind == "task_plan":
+            if forced:
+                assert record["approval"] == {"forced": True, "reason": RISK_REASON, "blocking_questions": [OPEN_QUESTION]}
             yield "submit_task_plan", args | {"digest": record["digest"], "tasks": [TASK]}
 
 
 @pytest.mark.parametrize("native", [False, True], ids=["gateway", "codex-0172"])
-def test_patrol_audit_and_reviewed_meeting(tmp_path, caplog, native):
+@pytest.mark.parametrize("forced", [False, True], ids=["ordinary", "forced"])
+def test_patrol_audit_and_reviewed_meeting(tmp_path, caplog, native, forced):
     path = binary() if native else None
     cfg = Config.load("config.example.toml")
     cfg.default_repo = "owner/product"
@@ -98,7 +105,7 @@ def test_patrol_audit_and_reviewed_meeting(tmp_path, caplog, native):
         token = vault.issue(Principal("worker", "codex", role, project, job_id, diagnose=True),
                             lease_token=job["lease_token"])
         p = vault.verify(token)
-        script = project_calls(kind, project)
+        script = project_calls(kind, project, forced)
         executed = []
         if native:
             def respond(body, index):
@@ -154,7 +161,7 @@ def test_patrol_audit_and_reviewed_meeting(tmp_path, caplog, native):
         assert jobs.get(job_id)["state"] == "COMPLETED"
         assert all(secret not in caplog.text for secret in (
             token, job["lease_token"], TRANSCRIPT, SPEC, INJECT, "PRIVATE_MINUTES", "PRIVATE_REPORT",
-            "PRIVATE_FINDING", "PRIVATE_WRONG", "PRIVATE_FIXTURE_ANSWER"))
+            OPEN_QUESTION, RISK_REASON, "PRIVATE_FINDING", "PRIVATE_WRONG", "PRIVATE_FIXTURE_ANSWER"))
 
     def run(kind, job_id):
         asyncio.run(exercise(kind, job_id))
@@ -180,7 +187,7 @@ def test_patrol_audit_and_reviewed_meeting(tmp_path, caplog, native):
     revised = flow.revise(meeting, reviewer, SPEC + "\nReview recorded.", "Review", based_on=draft)
     run("validation", state()["job_id"])
     assert not jobs.list_jobs(project, kinds=["task_plan"])
-    flow.approve(meeting, approver, revised)
+    flow.approve(meeting, approver, revised, force=forced, reason=RISK_REASON if forced else None)
     run("task_plan", state()["job_id"])
     flow.recover()
     assert state()["state"] == "PUBLISHED" and len(api.issues) == 1

@@ -117,6 +117,12 @@ class WorkflowResult(Record):
     job_id: str | None = None
 
 
+class AcceptedFindings(Record):
+    forced: Literal[True]
+    reason: str
+    blocking_questions: list[str]
+
+
 class WorkflowContext(Record):
     meeting: str
     state: str
@@ -124,7 +130,7 @@ class WorkflowContext(Record):
     digest: str | None = None
     markdown: str | None = None
     minutes: dict[str, JsonValue] | None = None
-    approval: dict[str, JsonValue] | None = None
+    approval: AcceptedFindings | None = None
     audit_result: dict[str, JsonValue] | None = None
 
 

@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 
 
-VERSION = 2
+VERSION = 3
 
 
 def _checked(path):
@@ -48,7 +48,7 @@ def _upgrade(db, project):
     from .workflow import migrate_workflow
 
     version = db.execute("PRAGMA user_version").fetchone()[0]
-    if version not in (0, 1, VERSION):
+    if version not in (0, 1, 2, VERSION):
         raise ValueError(f"Unsupported schema version {version}")
     if version == VERSION:
         return False
@@ -82,11 +82,12 @@ def migrate(path, *, project=None, dry_run=False):
             current = db.execute("PRAGMA user_version").fetchone()[0]
             if current == VERSION:
                 return False
-            if current not in (0, 1):
+            if current not in (0, 1, 2):
                 raise ValueError(f"Unsupported schema version {current}")
         # Preserve each pre-upgrade image, including the original after a failed attempt.
         from uuid import uuid4
-        backup(path, path.with_name(f"pre-v2-{uuid4().hex}.sqlite3"))
+        prefix = "pre-v3" if current == 2 else "pre-v2"
+        backup(path, path.with_name(f"{prefix}-{uuid4().hex}.sqlite3"))
     else:
         os.close(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600))
     with closing(sqlite3.connect(path)) as db:
