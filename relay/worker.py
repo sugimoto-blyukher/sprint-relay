@@ -19,6 +19,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .probe_diagnostics import emit
+
 SOCKET_DIR = Path("/run/sprintrelay-workers")
 INSTALL_DIR = Path("/opt/sprintrelay-workers")
 ACCOUNTS = Path("/var/lib")
@@ -83,10 +85,14 @@ class Launch(BaseModel):
     timeout_seconds: int = Field(ge=1, le=3600)
     model: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 
+    probe: bool = False
+    diagnose: bool = False
     snapshot: Snapshot | None = Field(default=None, repr=False)
 
     @model_validator(mode="after")
     def assigned_audit_only(self):
+        if (self.diagnose and not self.probe) or (self.probe and self.snapshot):
+            raise ValueError("Diagnostics are restricted to synthetic probes without source data")
         if self.snapshot and (self.role != "audit" or self.job_id != self.snapshot.job_id):
             raise ValueError("Source snapshot must belong to this audit job")
         return self
@@ -101,6 +107,12 @@ class QuotaFailure(str):
 
 
 def _prompt(req: Launch):
+    if req.probe:
+        return (f"Run the SprintRelay synthetic probe for project {req.project}. "
+                "First call the sprintrelay get_project_context MCP tool with this project_id. "
+                "Then call heartbeat_job with project_id and the exact job_id and lease_token "
+                "from the returned job object, and probe_answer equal to probe.challenge reversed "
+                "character by character. A text response cannot complete this job. Exit after the tool result.")
     role_prompt = MANAGEMENT if req.role == "management" else AUDIT
     if req.snapshot:
         role_prompt += (" The same filtered source is mounted at /evidence/context.json for this job. "
@@ -112,17 +124,24 @@ def _prompt(req: Launch):
             "Never run commands or tests. " + role_prompt)
 
 
-async def run_cli(provider, *, job_id, project, role, token, mcp_url, timeout_seconds=600, model=None, snapshot=None):
+def _diagnostic(req, provider, code, *, exit_code=None):
+    emit(code, enabled=req.diagnose, job_id=req.job_id, provider=provider, role=req.role,
+         exit_code=exit_code)
+
+
+async def run_cli(provider, *, job_id, project, role, token, mcp_url, timeout_seconds=600,
+                  model=None, snapshot=None, probe=False, diagnose=False):
     """Run a preclaimed job. None means CLI exit zero; Core checks durable MCP completion."""
     if role not in ROLES.get(provider, set()):
         return "CAPABILITY"
     req = Launch(job_id=job_id, project=project, role=role, token=token, mcp_url=mcp_url,
-                 timeout_seconds=timeout_seconds, model=model, snapshot=snapshot)
+                 timeout_seconds=timeout_seconds, model=model, snapshot=snapshot, probe=probe, diagnose=diagnose)
     writer = None
     try:
         async with asyncio.timeout(timeout_seconds + 5):
             endpoint = SOCKET_DIR / f"{provider}.sock"
             _trusted_socket(endpoint)
+            _diagnostic(req, provider, "WORKER_CONNECT")
             reader, writer = await asyncio.open_unix_connection(endpoint, limit=256)
             writer.write(req.model_dump_json().encode() + b"\n")
             await writer.drain()
@@ -131,10 +150,15 @@ async def run_cli(provider, *, job_id, project, role, token, mcp_url, timeout_se
                 return None
             if delay := re.fullmatch(r"QUOTA ([1-9][0-9]{0,8})", reply):
                 return QuotaFailure(int(delay[1]))
-            return reply if reply in FAILURES else "FORMAT"
+            if reply in FAILURES:
+                return reply
+            _diagnostic(req, provider, "WORKER_REPLY_INVALID")
+            return "FORMAT"
     except TimeoutError:
+        _diagnostic(req, provider, "TIMEOUT")
         return "TIMEOUT"
     except (OSError, UnicodeError, ValueError):
+        _diagnostic(req, provider, "WORKER_UNAVAILABLE")
         return "UNAVAILABLE"
     finally:
         if writer:
@@ -190,7 +214,7 @@ def _isolate(provider, bindings=()):
         cmd.extend(["--ro-bind", filename, filename])
     for file, target in bindings:
         cmd.extend(["--ro-bind", str(file), target])
-    cmd.extend(["--chdir", "/work", "--remount-ro", "/", "--", "/bin/agent"])
+    cmd.extend(["--chdir", "/work", "--remount-ro", "/proc", "--remount-ro", "/", "--", "/bin/agent"])
     return cmd
 
 
@@ -212,6 +236,9 @@ def _arguments(provider, req):
                         "computer_use", "skill_mcp_dependency_install", "in_app_browser",
                         "multi_agent_v2", "js_repl", "code_mode", "request_permissions_tool"):
             args.extend(["--disable", feature])
+        if req.probe:
+            args.extend(["-c", "mcp_servers.sprintrelay.required=true",
+                         "-c", 'mcp_servers.sprintrelay.enabled_tools=["get_project_context","heartbeat_job"]'])
         return args + model + ["-"]
     if provider == "claude_code":
         config = {"mcpServers": {"sprintrelay": {"type": "http", "url": req.mcp_url,
@@ -272,6 +299,28 @@ def _failure(err):
     return "TRANSIENT"
 
 
+def _cli_diagnostic(stderr, default=None):
+    data = stderr.lower()
+    if b"sprintrelay" in data or b"mcp" in data:
+        for code, patterns in (
+            ("MCP_CLIENT_AUTH_FAILED", (b"401 unauthorized", b"authentication required", b"invalid_token")),
+            ("MCP_CLIENT_LIST_FAILED", (b"tools/list", b"failed to list tools", b"listing tools")),
+            ("MCP_CLIENT_INIT_FAILED", (b"mcp client", b"mcp startup", b"mcp handshake", b"initialize response")),
+        ):
+            if any(pattern in data for pattern in patterns):
+                return code
+    for code, patterns in (
+        ("BWRAP_START_FAILED", (b"bwrap:",)),
+        ("CLI_CONFIG_INCOMPATIBLE", (b"unexpected argument", b"unknown feature", b"unknown field",
+                                     b"error loading config", b"failed to load configuration")),
+        ("INFERENCE_TRANSPORT_FAILED", (b"error sending request for url", b"stream disconnected",
+                                        b"error connecting to", b"502 bad gateway", b"503 service unavailable")),
+    ):
+        if any(pattern in data for pattern in patterns):
+            return code
+    return default
+
+
 def _google_config(directory, req):
     # Both files are job-private and mounted read-only over the CLI's default configuration.
     allow = ["mcp(sprintrelay/*)"]
@@ -309,10 +358,13 @@ async def _execute(provider, req):
             cmd = _isolate(provider, bindings)
             return await _execute_isolated(provider, req, cmd)
     except TimeoutError:
+        _diagnostic(req, provider, "TIMEOUT")
         return "TIMEOUT"
     except FileNotFoundError:
+        _diagnostic(req, provider, "BINARY_START_FAILED")
         return "UNAVAILABLE"
     except (ValueError, OSError, TypeError, AttributeError):
+        _diagnostic(req, provider, "SANDBOX_PREPARE_FAILED")
         return "CAPABILITY"
 
 
@@ -344,12 +396,19 @@ async def _execute_isolated(provider, req, cmd):
     _trusted(version_file)
     expected_version = version_file.read_bytes().strip()
     if not 1 <= len(expected_version) <= 160:
+        _diagnostic(req, provider, "VERSION_FAILED")
         return "CAPABILITY"
     async with asyncio.timeout(req.timeout_seconds):
         env = _agent_env()
-        rc, output, _ = await _invoke(cmd + ["--version"], env, diagnostics=True)
-        if rc or output.strip() != expected_version:
+        _diagnostic(req, provider, "VERSION_CHECK")
+        rc, output, err = await _invoke(cmd + ["--version"], env, diagnostics=True)
+        if rc:
+            _diagnostic(req, provider, _cli_diagnostic(err, "VERSION_FAILED"), exit_code=rc)
             return "CAPABILITY"
+        if output.strip() != expected_version:
+            _diagnostic(req, provider, "VERSION_MISMATCH")
+            return "CAPABILITY"
+        _diagnostic(req, provider, "ACCOUNT_CHECK")
         if provider == "antigravity":
             env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=/keyring/bus"
             # Only this worker UID's isolated Secret Service is mounted. The synthetic MCP
@@ -360,14 +419,26 @@ async def _execute_isolated(provider, req, cmd):
             ok = b"logged in using chatgpt" in (output + err).lower().splitlines()
         else:
             rc, output, _ = await _invoke(cmd + ["auth", "status"], env, diagnostics=True)
-            status = json.loads(output) if not rc else {}
-            ok = status.get("loggedIn") is True and status.get("authMethod") == "claude.ai"
+            try:
+                status = json.loads(output) if not rc else None
+            except ValueError:
+                status = None
+            ok = (isinstance(status, dict) and status.get("loggedIn") is True
+                  and status.get("authMethod") == "claude.ai")
         if rc or not ok:
+            _diagnostic(req, provider, "ACCOUNT_AUTH_FAILED", exit_code=rc)
             return "AUTH"
         env["SPRINTRELAY_JOB_TOKEN"] = req.token
         prompt = b"" if provider == "antigravity" else _prompt(req).encode()
+        _diagnostic(req, provider, "CLI_START")
         with _mount_snapshot(cmd, req.snapshot) as (isolated, fds):
             rc, _, err = await _invoke(isolated + _arguments(provider, req), env, prompt, pass_fds=fds)
+        _diagnostic(req, provider, "CLI_EXIT", exit_code=rc)
+        detail = _cli_diagnostic(err, "CLI_FAILED" if rc else None)
+        if detail:
+            _diagnostic(req, provider, detail, exit_code=rc)
+        if rc and detail in {"BWRAP_START_FAILED", "CLI_CONFIG_INCOMPATIBLE"}:
+            return "CAPABILITY"
         return _failure(err) if rc else "exited"
 
 

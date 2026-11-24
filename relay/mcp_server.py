@@ -20,6 +20,66 @@ from starlette.routing import Route
 
 from .mcp_contracts import ALLOWED, T
 from .security import OAuthVerifier, TokenVault
+from .probe_diagnostics import emit
+
+
+PROBE_TOOLS = {
+    "get_project_context": "Read the assigned synthetic challenge and the job ID and lease for this connection.",
+    "heartbeat_job": "For a synthetic probe, submit the reversed challenge as probe_answer with the assigned job and lease.",
+}
+WIRE_CODES = {"initialize": "MCP_INITIALIZE", "tools/list": "MCP_TOOLS_LIST"}
+CALL_CODES = {"get_project_context": "MCP_GET_PROJECT_CONTEXT", "heartbeat_job": "MCP_HEARTBEAT_JOB"}
+
+
+def _diagnostic(principal, code, *, status=None):
+    emit(code, enabled=principal.diagnose, job_id=principal.job_id, provider=principal.provider,
+         role=principal.role, status=status)
+
+
+async def _observe_probe(transport, principal, scope, receive, send):
+    # Observe only a bounded method name for authenticated probe requests. The
+    # SDK still owns HTTP parsing, validation and the actual response.
+    body = bytearray()
+    oversized = False
+
+    async def observed_receive():
+        nonlocal oversized
+        message = await receive()
+        if message["type"] == "http.request" and not oversized:
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) <= 8192:
+                body.extend(chunk)
+            else:
+                body.clear()
+                oversized = True
+        return message
+
+    status = None
+
+    async def observed_send(message):
+        nonlocal status
+        if message["type"] == "http.response.start":
+            code = "MCP_HTTP"
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and isinstance(parsed.get("method"), str):
+                    code = WIRE_CODES.get(parsed["method"], code)
+            except (ValueError, UnicodeError, RecursionError):
+                pass
+            status = message["status"]
+            _diagnostic(principal, code, status=status)
+        elif message["type"] == "http.response.body" and not message.get("more_body"):
+            payload = message.get("body", b"")
+            if 0 < len(payload) <= 8192:
+                try:
+                    parsed = json.loads(payload)
+                    if isinstance(parsed, dict) and "error" in parsed:
+                        _diagnostic(principal, "MCP_RPC_ERROR", status=status)
+                except (ValueError, UnicodeError, RecursionError):
+                    pass
+        await send(message)
+
+    await transport.handle_request(scope, observed_receive, observed_send)
 
 
 class BoundaryError(Exception):
@@ -55,30 +115,38 @@ def create_app(gateway, *, local_tokens: TokenVault | None = None, oauth: OAuthV
         sdk, stateless=True, json_response=True, max_request_body_size=5_000_000,
         security_settings=TransportSecuritySettings(allowed_hosts=hosts, allowed_origins=origins))
     calls = {}
+    last_rejection = float("-inf")
 
     @sdk.list_tools()
     async def list_tools():
         principal = sdk.request_context.request.scope["relay.identity"]
-        return [types.Tool(name=name, inputSchema=T[name][0].model_json_schema(),
+        names = PROBE_TOOLS if principal.synthetic_probe else ALLOWED[principal.role]
+        return [types.Tool(name=name, description=PROBE_TOOLS.get(name),
+                           inputSchema=T[name][0].model_json_schema(),
                            outputSchema=T[name][1].model_json_schema())
-                for name in sorted(ALLOWED[principal.role])]
+                for name in sorted(names)]
 
     @sdk.call_tool(validate_input=False)
     async def call(name, arguments):
         principal = sdk.request_context.request.scope["relay.identity"]
+        _diagnostic(principal, CALL_CODES.get(name, "MCP_OTHER_CALL"))
         try:
             result = await asyncio.to_thread(gateway.dispatch, name, principal, arguments)
             output = T[name][1].model_validate(result).model_dump(mode="json", exclude_unset=True)
             return types.CallToolResult(structuredContent=output,
                                         content=[types.TextContent(type="text", text=json.dumps(output, ensure_ascii=False))])
         except BoundaryError as exc:
+            _diagnostic(principal, "MCP_TOOL_FAILED")
             return _result(exc.code)
         except PermissionError:
+            _diagnostic(principal, "MCP_TOOL_FAILED")
             return _result("UNAUTHORIZED")
         except (ValueError, KeyError, TypeError, OverflowError):
+            _diagnostic(principal, "MCP_TOOL_FAILED")
             return _result("INVALID_INPUT")
         except Exception:
             # External service exceptions or validation errors can include inputs.
+            _diagnostic(principal, "MCP_TOOL_FAILED")
             return _result("UNAVAILABLE")
 
     metadata_path = "/.well-known/oauth-protected-resource/mcp"
@@ -87,6 +155,7 @@ def create_app(gateway, *, local_tokens: TokenVault | None = None, oauth: OAuthV
 
     class Endpoint:
         async def __call__(self, scope, receive, send):
+            nonlocal last_rejection
             request = Request(scope, receive)
             if oauth:
                 permitted = scope["scheme"] == "https" and request.headers.get("host") == host
@@ -100,6 +169,10 @@ def create_app(gateway, *, local_tokens: TokenVault | None = None, oauth: OAuthV
             if permitted and not scope["query_string"] and len(parts) == 2 and parts[0].lower() == "bearer" and len(parts[1]) <= 8192:
                 principal = await oauth.verify(parts[1]) if oauth else local_tokens.verify(parts[1])
             if not principal or principal.project != gateway.project or principal.role not in ALLOWED:
+                now = time.monotonic()
+                if local_tokens and now - last_rejection >= 5 and local_tokens.diagnostic_active():
+                    emit("MCP_AUTH_REJECTED", enabled=True, status=401)
+                    last_rejection = now
                 response = JSONResponse({"error": "invalid_token"}, status_code=401,
                                         headers={"WWW-Authenticate": challenge})
             else:
@@ -113,8 +186,13 @@ def create_app(gateway, *, local_tokens: TokenVault | None = None, oauth: OAuthV
                 if len(recent) < 180:
                     recent.append(now)
                     scope["relay.identity"] = principal
-                    await transport.handle_request(scope, receive, send)
+                    if principal.diagnose:
+                        _diagnostic(principal, "MCP_AUTH_ACCEPTED")
+                        await _observe_probe(transport, principal, scope, receive, send)
+                    else:
+                        await transport.handle_request(scope, receive, send)
                     return
+                _diagnostic(principal, "MCP_HTTP", status=429)
                 response = JSONResponse({"error": "rate_limited"}, status_code=429, headers={"Retry-After": "60"})
             await response(scope, receive, send)
 

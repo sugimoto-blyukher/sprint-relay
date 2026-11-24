@@ -89,6 +89,7 @@ interval_seconds = 60
 recovery_interval_minutes = 45
 max_backoff_minutes = 360
 [jobs]
+probe_diagnostics = false # Fixed diagnostic codes for synthetic probes only.
 timeout_seconds = 600
 max_retries = 1
 max_audit_concurrency = 1

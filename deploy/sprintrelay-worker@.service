@@ -5,7 +5,7 @@ Requires=sprintrelay-worker@%i.socket
 [Service]
 User=sprintrelay-%i
 Group=sprintrelay-%i
-ExecStart=/opt/sprintrelay/.venv/bin/python -m relay.worker %i
+ExecStart=/opt/sprintrelay/.venv/bin/python -I -m relay.worker %i
 UMask=0077
 WorkingDirectory=/
 NoNewPrivileges=yes
@@ -13,7 +13,10 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ProtectKernelTunables=yes
+# systemd's protected /proc mounts can block creation of the nested
+# PID namespace's procfs. The CLI receives a fresh read-only /proc.
+ProtectKernelTunables=no
+ReadOnlyPaths=/sys
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 ProtectProc=invisible

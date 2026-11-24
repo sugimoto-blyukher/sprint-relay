@@ -95,3 +95,5 @@ A mapped GitHub user can enter `!relay ACTION [VALUE]` in a new comment on the p
 - For scope changes, revise, validate and approve the updated spec. In the meetings channel, use `/scope pending` to inspect required decisions and `/scope resolve` to accept or decline one. Active work is reviewed by its owner. Completed work can generate follow-up issues. Approvers decide cancellation candidates.
 
 The service recalculates after Discord task and approval changes. Every 60 seconds by default it polls GitHub, recalculates overdue work and delivers grouped notices. Use `/schedule show` to refresh on demand. Delivery retries use the persisted notification queue. A crash between sending a Discord message and recording its acknowledgement can cause repeat delivery.
+
+- 承認者はタスクチャンネルで `/relay retry provider:codex` を実行できます。 `role:management` または `role:audit` で限定でき、省略時はそのプロバイダーに設定された両方の役割が対象です。対象は合成 Probe です。既存の待機中・実行中 Probe には同じ ID が返り、レート制限中は再試行可能時刻が返ります。発行済みデータ、失敗履歴、実行中のリースを保持します。[再デプロイと両役割の合格条件](deployment.md#worker-更新と-codex-の実環境受け入れ)

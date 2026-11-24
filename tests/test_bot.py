@@ -95,10 +95,16 @@ class BotTests(unittest.TestCase):
             ctx = NS(user=NS(id=10104), guild_id=guild.id, channel_id=11112,
                      response=NS(defer=AsyncMock()), followup=NS(send=AsyncMock()))
             await members.get_command("pause").callback(ctx)
+            await members.get_command("retry").callback(ctx, "codex")
             self.service.control.pause.assert_not_called()
+            self.service.control.retry.assert_not_called()
             ctx.user.id = 10101
             await members.get_command("pause").callback(ctx)
             self.service.control.pause.assert_called_once_with("10101")
+            self.service.control.retry.return_value = [{"state": "queued", "role": "audit", "job_id": "fixture"}]
+            await members.get_command("retry").callback(ctx, "codex", "audit")
+            self.service.control.retry.assert_called_once_with("10101", "codex", "audit")
+            self.assertIn("fixture", ctx.followup.send.call_args.args[0])
             command = client.command_tree.get_command("progress", guild=guild)
             await command.callback(ctx)
             self.assertIn("Todo", ctx.followup.send.call_args.args[0])

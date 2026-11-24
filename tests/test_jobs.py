@@ -295,3 +295,84 @@ def test_commission_cli_and_remote_schedule_without_releasing_project_data(queue
     for provider in POLICY:
         with pytest.raises(PermissionError):
             queue.claim(real, provider)
+
+
+def test_operator_retry_preserves_attempts_and_deduplicates_probes(queue):
+    from relay.runtime import Control
+
+    queue.maintenance(PROJECT)
+    previous = queue.list_jobs(PROJECT, role="management", provider="codex", kinds=["probe"])[0]
+    claimed = queue.claim(previous["id"], "codex")
+    queue.fail(previous["id"], "codex", claimed["lease_token"], "FORMAT")
+    wake = []
+    admin = next(iter(queue.config.approvers))
+    control = Control(queue.config, queue, wake=lambda: wake.append(True))
+    with pytest.raises(PermissionError):
+        control.retry("99999", "codex")
+    with pytest.raises(ValueError):
+        control.retry(admin, "muse")
+    with pytest.raises(ValueError):
+        control.retry(admin, "claude_code", "audit")
+    receipt, = control.retry(admin, "codex", "management")
+    assert receipt["state"] == "queued"
+    assert wake
+    new_id = receipt["job_id"]
+    assert new_id != previous["id"]
+    assert control.retry(admin, "codex", "management") == [
+        {"role": "management", "state": "already_queued", "job_id": new_id}]
+    queue.maintenance(PROJECT)
+    rerun = queue.claim(new_id, "codex")
+    assert control.retry(admin, "codex", "management")[0]["state"] == "running"
+    queue.require_lease(new_id, "codex", rerun["lease_token"])
+    with queue.transaction(write=False) as db:
+        assert db.execute("SELECT outcome FROM job_attempts WHERE job_id=?", (previous["id"],)).fetchone()[0] == "FORMAT"
+        rows = db.execute("SELECT actor,provider,outcome,job_id FROM audit_log WHERE operation='probe_retry'").fetchall()
+        assert [tuple(r) for r in rows] == [(admin, "codex", "success", new_id)] * 3
+    assert queue.get(previous["id"])["state"] == "FAILED"
+
+
+def test_operator_retry_obeys_account_wide_quota(queue):
+    queue.maintenance(PROJECT)
+    probe = queue.list_jobs(PROJECT, role="management", provider="codex", kinds=["probe"])[0]
+    claimed = queue.claim(probe["id"], "codex")
+    queue.fail(probe["id"], "codex", claimed["lease_token"], "QUOTA", retry_after=12_000)
+    admin = next(iter(queue.config.approvers))
+    results = queue.retry_probe(PROJECT, "codex", None, actor=admin)
+    assert {r["role"] for r in results} == {"management", "audit"}
+    assert all(r["state"] == "cooldown" and r["retry_at"] >= queue.clock() + 12_000 for r in results)
+    assert not queue.list_jobs(PROJECT, provider="codex")
+    queue.clock.advance(12_000)
+    assert all(r["state"] in {"queued", "already_queued"} for r in queue.retry_probe(PROJECT, "codex", None, actor=admin))
+
+
+def test_operator_retry_waits_for_cli_exit_even_after_probe_proof(queue, inline_worker):
+    async def exercise():
+        holding = asyncio.Event()
+        proved = asyncio.Event()
+        admin = next(iter(queue.config.approvers))
+        first, = queue.retry_probe(PROJECT, "codex", "management", actor=admin)
+        queue.clock.advance(1)
+        second, = queue.retry_probe(PROJECT, "codex", "audit", actor=admin)
+
+        async def dispatch(job, provider):
+            assert job["id"] == first["job_id"]
+            queue.complete(job["id"], provider, job["lease_token"],
+                           {"challenge": job["payload"]["challenge"]})
+            proved.set()
+            await holding.wait()
+
+        # Isolate the provider under test from other enabled fixture clients.
+        for provider in ("claude_code", "antigravity"):
+            queue.config.agents[provider] = queue.config.agents[provider].model_copy(update={"enabled": False})
+        watcher = Watchdog(queue, PROJECT, dispatch=dispatch, worker=inline_worker)
+        await watcher.tick()
+        try:
+            await asyncio.wait_for(proved.wait(), 1)
+            assert queue.get(first["job_id"])["state"] == "COMPLETED"
+            await watcher.tick()
+            assert queue.get(second["job_id"])["state"] == "PENDING"
+        finally:
+            holding.set()
+            await asyncio.gather(*watcher.running)
+
+    asyncio.run(exercise())

@@ -2,6 +2,8 @@
 import asyncio
 import logging
 
+from .probe_diagnostics import emit
+
 log = logging.getLogger(__name__)
 
 
@@ -11,8 +13,10 @@ class Watchdog:
         self.project = project
         self.dispatch = dispatch
         self.notify = notify
-        self.running = set()
+        self.running = {}
         self.worker = worker
+        self._wake = asyncio.Event()
+        self._loop = None
 
     async def _execute(self, job):
         try:
@@ -24,13 +28,18 @@ class Watchdog:
                 log.warning("Worker exited (%s)", type(exc).__name__)
                 error = "TRANSIENT"
             # Only a transactionally validated MCP submission can complete work.
-            if (await self.worker(self.store.get, job["id"]))["state"] == "RUNNING":
+            state = (await self.worker(self.store.get, job["id"]))["state"]
+            if job.get("kind") == "probe" and self.store.config.jobs.probe_diagnostics:
+                code = "PROBE_COMPLETED" if state == "COMPLETED" else "CLI_EXITED_WITHOUT_MCP_COMPLETION"
+                if state == "COMPLETED" or error is None:
+                    emit(code, enabled=True, job_id=job["id"], provider=job["provider"], role=job["role"])
+            if state == "RUNNING":
                 await self.worker(self.store.fail, job["id"], job["provider"], job["lease_token"],
                                   error or "FORMAT", retry_after=getattr(error, "retry_after", None))
         except PermissionError:
             pass  # A timeout, pause or newer generation has fenced this process.
 
-    def _poll(self):
+    def _poll(self, busy_providers):
         self.store.maintenance(self.project)
         self.store.route_notices(self.project)
         if self.notify:
@@ -38,23 +47,39 @@ class Watchdog:
                 self.notify(f"watchdog:{self.project}:{receipt}", message)
                 self.store.acknowledge(receipt)
 
-        return self.store.dispatchable(self.project) if self.dispatch else []
+        return self.store.dispatchable(self.project, busy_providers=busy_providers) if self.dispatch else []
 
     async def tick(self):
-        for job in await self.worker(self._poll):
+        busy_providers = frozenset(self.running.values())
+        for job in await self.worker(self._poll, busy_providers):
             task = asyncio.create_task(self._execute(job))
-            self.running.add(task)
-            task.add_done_callback(self.running.discard)
+            self.running[task] = job["provider"]
+            task.add_done_callback(self._released)
+
+    def _released(self, task):
+        self.running.pop(task, None)
+        if self._loop is not None:
+            self._wake.set()
+
+    def wake(self):
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._wake.set)
 
     async def run(self):
+        self._loop = asyncio.get_running_loop()
         try:
             while True:
+                self._wake.clear()
                 try:
                     await self.tick()
                 except Exception as exc:
                     log.warning("Watchdog check deferred (%s)", type(exc).__name__)
-                await asyncio.sleep(self.store.config.watchdog.interval_seconds)
+                try:
+                    await asyncio.wait_for(self._wake.wait(), self.store.config.watchdog.interval_seconds)
+                except TimeoutError:
+                    pass
         finally:
+            self._loop = None
             for task in tuple(self.running):
                 task.cancel()
             await asyncio.gather(*self.running, return_exceptions=True)

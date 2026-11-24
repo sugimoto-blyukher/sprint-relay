@@ -22,8 +22,8 @@ DYNAMIC = ("agents", "patrol", "watchdog", "jobs", "github_sync", "privacy")
 
 
 class Control:
-    def __init__(self, config, store):
-        self.config, self.store = config, store
+    def __init__(self, config, store, wake=None):
+        self.config, self.store, self.wake = config, store, wake
         self.project = config.management_repo
 
     def status(self):
@@ -45,6 +45,13 @@ class Control:
     def resume(self, actor):
         self._authorize(actor)
         self.store.set_paused(self.project, False, actor=str(actor))
+
+    def retry(self, actor, provider, role=None):
+        self._authorize(actor)
+        receipts = self.store.retry_probe(self.project, provider, role, actor=str(actor))
+        if self.wake and any(item["state"] in {"queued", "already_queued"} for item in receipts):
+            self.wake()
+        return receipts
 
     def patrol(self, actor):
         self._authorize(actor)
@@ -88,6 +95,13 @@ async def serve(config, config_path, path, management_token, product_token, disc
     from .watchdog import Watchdog
     from .worker import run_cli
 
+    # The SDK can include malformed input in validation warnings. Diagnostics
+    # use only the allowlisted events emitted by the relay instead.
+    for name in ("mcp.server.streamable_http", "mcp.server.transport_security",
+                 "mcp.server.lowlevel.server", "mcp.server.session",
+                 "mcp.server.streamable_http_manager", "mcp.shared.session"):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+
     project = config.management_repo
     github = GitHub(config, management_token, path, product_token=product_token)
     if not await asyncio.to_thread(github.is_private, project):
@@ -100,7 +114,10 @@ async def serve(config, config_path, path, management_token, product_token, disc
     vault = TokenVault()
 
     async def dispatch(job, provider):
-        identity = Principal(f"worker:{job['id']}", provider, job["role"], project, str(job["id"]))
+        probe = job["kind"] == "probe"
+        diagnose = probe and config.jobs.probe_diagnostics
+        identity = Principal(f"worker:{job['id']}", provider, job["role"], project, str(job["id"]),
+                             synthetic_probe=probe, diagnose=diagnose)
         ttl = config.jobs.timeout_seconds
         snapshot = None
         if job["kind"] == "audit" and job["payload"].get("kind") in {"pr", "ci"}:
@@ -119,12 +136,13 @@ async def serve(config, config_path, path, management_token, product_token, disc
         try:
             return await run_cli(provider, project=project, role=job["role"], job_id=str(job["id"]),
                                  token=token, mcp_url=f"http://127.0.0.1:{config.mcp.local_port}/mcp",
-                                 timeout_seconds=ttl, model=config.agents[provider].model, snapshot=snapshot)
+                                 timeout_seconds=ttl, model=config.agents[provider].model, snapshot=snapshot,
+                                 probe=probe, diagnose=diagnose)
         finally:
             vault.revoke(token)
 
     watchdog = Watchdog(jobs, project, dispatch=dispatch, notify=github.notify)
-    control = Control(config, jobs)
+    control = Control(config, jobs, wake=watchdog.wake)
     service = Service(config, github, workflow, control, path)
     client = create_client(service)
     cfg_file = ConfigurationFile(config_path, config, github.notify)
@@ -150,9 +168,16 @@ async def serve(config, config_path, path, management_token, product_token, disc
                        proxy_headers=port == config.mcp.remote_port and config.mcp.remote_enabled,
                        forwarded_allow_ips="127.0.0.1", server_header=False, log_config=None))
                for app, port in endpoints]
+    async def run_watchdog():
+        # Probe clients may be launched immediately on a fresh or restarted
+        # Core. Wait for the local socket and SDK lifespan before dispatching.
+        while not servers[0].started:
+            await asyncio.sleep(0.05)
+        await watchdog.run()
+
     workers = [asyncio.create_task(server.serve()) for server in servers]
     workers.extend([asyncio.create_task(client.start(discord_token)),
-                    asyncio.create_task(watchdog.run()), asyncio.create_task(maintain())])
+                    asyncio.create_task(run_watchdog()), asyncio.create_task(maintain())])
     try:
         done, _ = await asyncio.wait(workers, return_when=asyncio.FIRST_COMPLETED)
         for task in done:

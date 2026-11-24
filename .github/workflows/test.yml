@@ -15,6 +15,9 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: pyproject.toml
+      - name: Check deployment script syntax
+        run: |
+          for script in deploy/*.sh; do bash -n "$script"; done
       - run: python -m pip install -e '.[test]'
       - run: python -m relay check --config config.example.toml
       - run: python -m relay migrate --dry-run --config config.example.toml
