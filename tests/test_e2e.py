@@ -1,5 +1,6 @@
 """Acceptance walkthrough using Discord command callbacks and a simulated GitHub API."""
 import asyncio
+import json
 import socket
 from dataclasses import replace
 from datetime import datetime
@@ -34,7 +35,8 @@ def attachment(name, text):
     return SimpleNamespace(filename=name, size=len(raw), read=AsyncMock(return_value=raw))
 
 
-def test_transcript_to_cross_channel_delivery(tmp_path, monkeypatch, inline_worker):
+@pytest.mark.parametrize("force", [False, True], ids=["ordinary", "forced"])
+def test_transcript_to_cross_channel_delivery(tmp_path, monkeypatch, inline_worker, force):
     monkeypatch.setattr("relay.core.datetime", EventClock)
     monkeypatch.setattr("relay.schedule.datetime", EventClock)
     config = Config.load(Path(__file__).resolve().parents[1] / "config.example.toml")
@@ -135,23 +137,48 @@ def test_transcript_to_cross_channel_delivery(tmp_path, monkeypatch, inline_work
     with pytest.raises(ValueError):
         flow.approve(meeting, approver, revision)
     validation = claim("validation")
-    tool("submit_validation", **validation, digest=revision, blocking_questions=[],
+    questions = ["Which keyboard layout should a future version cover?"] if force else []
+    tool("submit_validation", **validation, digest=revision, blocking_questions=questions,
          checks={category: "Checked against fixture decision" for category in CHECKS})
     with pytest.raises(ValueError):
         flow.approve(meeting, approver, draft)
     assert not api.issues
 
     args = dict(meeting=meeting, digest=revision)
+    reason = "The team accepts this open compatibility question for the prototype."
+    if force:
+        args.update(force=True, reason=reason)
+        assert "approver" in command("spec", "approve", "meetings", designer, **args).lower()
+        assert not tool("list_workflow_jobs", kinds=["task_plan"])["jobs"]
     for _ in range(2):
         result = command("spec", "approve", "meetings", approver, **args)
-        assert "Approved" in result
+        assert result.startswith("Force-approved" if force else "Approved")
+    if force:
+        retry = command("spec", "approve", "meetings", approver, meeting=meeting, digest=revision)
+        assert retry.startswith("Force-approved")
+    review = command("spec", "show", "meetings", designer, meeting=meeting, view="review")
+    if isinstance(review, discord.File):
+        with review.fp as file:
+            review = file.read()
+    review = json.loads(review)
+    assert review["approval"]["forced"] is force
+    assert review["approval"]["reason"] == (reason if force else None)
+    assert review["report"]["blocking_questions"] == questions
     planning = claim("task_plan")
+    context = tool("get_specification", **planning)
+    if force:
+        assert context["approval"] == {"forced": True, "reason": reason, "blocking_questions": questions}
+    else:
+        assert "approval" not in context
     tool("submit_task_plan", **planning, digest=revision, tasks=[build, build_test])
     # The durable publication worker may run more than once.
     flow.recover()
     flow.recover()
     assert flow.show(meeting, designer)["state"] == "PUBLISHED"
     assert len(api.issues) == 2
+    if force:
+        assert sum("FORCE-APPROVED" in body for _, body in github.notifications()) == 1
+        assert all(reason not in body for _, body in github.notifications())
     assert any("/specs/" in path for path in api.files)
     assert any(path == "/graphql" and "addProjectV2ItemById" in body["query"]
                for _, path, body in api.calls)

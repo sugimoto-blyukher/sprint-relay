@@ -1,9 +1,10 @@
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from relay.workflow import CHECKS, Workflow
+from relay.workflow import CHECKS, Workflow, _digest, private_db
 
 
 class Issues:
@@ -138,3 +139,70 @@ def test_oversized_issue_preflight_keeps_approval_editable(flow, stage, oversize
         flow.approve(meeting, "33", digest, tasks=[{**proposal(), **oversized}])
     assert flow.show(meeting, "22")["approved_by"] is None
     assert flow.github.archived == previous_archives
+
+
+def test_force_requires_completed_current_review_and_scoped_approver(flow):
+    meeting = flow.import_meeting("fixture", "sample", "22")
+    draft = flow.draft(meeting, "22", markdown=SPEC, minutes=MINUTES)
+    args = {"force": True, "reason": "Accept the open encoding decision"}
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", draft, **args)
+    digest = flow.revise(meeting, "22", SPEC, "Human reviewed")
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", digest, **args)
+    blockers = {**report(digest), "blocking_questions": ["Which encoding?"]}
+    flow.validate(meeting, "33", digest, report=blockers)
+    other = Workflow(flow.path, flow.config, flow.github, project="other/project")
+    with pytest.raises(ValueError, match="Unknown meeting"):
+        other.approve(meeting, "33", digest, **args)
+    with pytest.raises(PermissionError):
+        flow.approve(meeting, "22", digest, **args)
+    for reason in (None, "", " \t\n"):
+        with pytest.raises(ValueError):
+            flow.approve(meeting, "33", digest, force=True, reason=reason)
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", draft, **args)
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", digest, tasks=[{**proposal(), "requirement_ids": ["REQ-999"]}], **args)
+    assert flow.show(meeting, "22")["approval"] is None
+
+    tasks = flow.approve(meeting, "33", digest, tasks=[proposal()], **args)
+    assert [task.key for task in tasks] == ["export"]
+    before = flow.show(meeting, "22")
+    receipt = before["approval"]
+    assert receipt == {"meeting": meeting, "project": flow.project, "digest": digest,
+                       "actor": "33", "approved_at": receipt["approved_at"], "forced": True,
+                       "reason": args["reason"], "report_hash": _digest(blockers)}
+    assert receipt["approved_at"]
+    assert before["report"] == blockers and before["minutes"] == MINUTES
+    head = flow.revise(meeting, "22", SPEC, "Another human review")
+    assert flow.show(meeting, "22")["approval"] is None
+    assert flow.show(meeting, "22", digest=digest)["approval"] == receipt
+    for target in (head, digest):
+        with pytest.raises(ValueError):
+            flow.approve(meeting, "33", target, **args)
+    flow.validate(meeting, "33", head, report=report(head))
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", head, **args)
+    flow.approve(meeting, "33", head)
+    ordinary = flow.show(meeting, "22")["approval"]
+    assert ordinary["forced"] is False and ordinary["reason"] is None
+
+
+@pytest.mark.parametrize("damage", ["missing report", "different digest", "missing reviewer", "no parent"])
+def test_forced_approval_rejects_incomplete_validation_evidence(flow, damage):
+    meeting, head = revised(flow)
+    original = {**report(head), "blocking_questions": ["Which encoding?"]}
+    flow.validate(meeting, "33", head, report=original)
+    with private_db(flow.path) as db:
+        if damage == "different digest":
+            db.execute("UPDATE revision SET report=? WHERE digest=?", (json.dumps({**original, "revision": "old"}), head))
+        elif damage == "missing report":
+            db.execute("UPDATE revision SET report=NULL WHERE digest=?", (head,))
+        elif damage == "missing reviewer":
+            db.execute("UPDATE revision SET reviewer=NULL WHERE digest=?", (head,))
+        else:
+            db.execute("UPDATE revision SET parent=NULL WHERE digest=?", (head,))
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", head, force=True, reason="Accept the limitations")
+    assert flow.show(meeting, "22")["approval"] is None

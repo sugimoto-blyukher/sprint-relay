@@ -36,7 +36,7 @@ def test_run_migrates_and_starts_with_separate_credentials(tmp_path, monkeypatch
     async def connect(config, config_path, db_path, management, product, discord):
         assert config_path == EXAMPLE
         with closing(sqlite3.connect(db_path)) as db:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         calls.append((management, product, discord))
 
     monkeypatch.setattr("relay.__main__.os.umask", lambda mask: 0o077)
@@ -182,3 +182,25 @@ def test_core_uses_same_database_and_separate_mcp_listeners(tmp_path, monkeypatc
     assert set(boundaries[0][1]) == {"local_tokens"} and set(boundaries[1][1]) == {"oauth"}
     assert [(entry.host, entry.port, entry.proxy_headers) for entry in listeners] == [
         ("127.0.0.1", 8371, False), ("127.0.0.1", 8372, True)]
+
+
+def test_v2_approval_receipt_migrates_as_ordinary(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    path.touch(mode=0o600)
+    receipt = ("revision", "project", "meeting", "original-hash", "approver", "2030-01-01")
+    with closing(sqlite3.connect(path)) as db:
+        db.execute("""CREATE TABLE workflow_approval (digest TEXT PRIMARY KEY, project TEXT NOT NULL,
+            meeting TEXT NOT NULL, report_hash TEXT NOT NULL, actor TEXT NOT NULL, approved_at TEXT)""")
+        db.execute("INSERT INTO workflow_approval VALUES(?,?,?,?,?,?)", receipt)
+        db.execute("PRAGMA user_version=2")
+        db.commit()
+    assert migrate(path, project="project", dry_run=True)
+    assert migrate(path, project="project")
+    assert not migrate(path, project="project")
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (3,)
+        assert db.execute("SELECT * FROM workflow_approval").fetchone() == (*receipt, 0, None)
+    old, = tmp_path.glob("pre-v3-*.sqlite3")
+    with closing(sqlite3.connect(old)) as db:
+        assert db.execute("PRAGMA user_version").fetchone() == (2,)
+        assert db.execute("SELECT * FROM workflow_approval").fetchone() == receipt

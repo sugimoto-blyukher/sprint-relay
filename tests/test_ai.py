@@ -196,7 +196,7 @@ def test_consent_revocation_fences_running_work_and_regrant_starts_new_attempt(f
     submit(flow, claim(flow, meeting), {"minutes": MINUTES})
 
 
-def test_spec_audit_yields_lease_and_high_finding_requires_human_revision(flow):
+def test_spec_audit_requires_human_resolution_and_separate_public_clearance(flow):
     meeting = start(flow, providers=("muse", "codex"))
     digest = flow.revise(meeting, "22", SPEC, "Human review")
     management = claim(flow, meeting)
@@ -206,6 +206,8 @@ def test_spec_audit_yields_lease_and_high_finding_requires_human_revision(flow):
     assert flow.show(meeting, "22")["state"] == "WAITING_AUDIT"
     with pytest.raises(ValueError):
         flow.approve(meeting, "33", digest)
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", digest, force=True, reason="Review pending")
     # A separate validated audit worker/receipt. A real submission also checks
     # evidence anchors in Patrol.submit_result (covered by the audit tests).
     with flow.jobs.transaction() as db:
@@ -218,7 +220,36 @@ def test_spec_audit_yields_lease_and_high_finding_requires_human_revision(flow):
     checking = claim(flow, meeting)
     assert flow.job_context(checking, "muse")["audit_result"] == result
     submit(flow, checking, validation(digest))
-    assert flow.show(meeting, "22")["state"] == "NEEDS_REVISION"
+    blocked = flow.show(meeting, "22")
+    assert blocked["state"] == "NEEDS_REVISION"
+    reason = "Accept the interface risk for this prototype"
+    job_id = flow.approve(meeting, "33", digest, force=True, reason=reason)
+    assert flow.approve(meeting, "33", digest, force=True, reason="Second click") == job_id
+    restored = Workflow(flow.path, flow.config, flow.github, jobs=flow.jobs)
+    assert restored.show(meeting, "22")["report"] == blocked["report"]
+    job = claim(restored, meeting)
+    with pytest.raises(PermissionError):
+        restored.job_context(job, "antigravity")
+    context = restored.job_context(job, "muse")["approval"]
+    assert context == {"forced": True, "reason": reason, "blocking_questions": ["Interface cannot meet REQ-001"]}
+    assert flow.jobs.artifact(flow.jobs.get(audit_id)["result_ref"]) == result
+
+    flow.github.private = False
+    with pytest.raises(PermissionError):
+        submit(flow, job, {"digest": digest, "tasks": [proposal()]})
+    flow.github.private = True
+    submit(flow, job, {"digest": digest, "tasks": [proposal()]})
+    flow.github.private = False
+    with pytest.raises(PermissionError, match="Public release paused"):
+        restored.recover()
+    assert not flow.github.issues
+    pending = restored.show(meeting, "33")
+    with pytest.raises(ValueError):
+        restored.approve(meeting, "33", digest, tasks={"confirm_public_release": True, "plan_hash": "wrong"})
+    restored.approve(meeting, "33", digest, tasks={"confirm_public_release": True, "plan_hash": pending["plan_hash"]})
+    restored.approve(meeting, "33", digest, force=True, reason="Retry after publication")
+    assert len(flow.github.issues) == 1
+    assert restored.show(meeting, "22")["approval"] == pending["approval"]
 
 
 def test_preflight_releases_sqlite_writer_and_keys_reserved_across_meetings(flow, monkeypatch):
@@ -305,3 +336,21 @@ def test_a16_legacy_partial_plan_needs_exact_public_attestation(tmp_path):
         assert db.execute("SELECT plan FROM revision WHERE digest=?", (digest,)).fetchone()[0] == frozen
         release = db.execute("SELECT * FROM workflow_public_release").fetchone()
         assert (release["actor"], release["plan_hash"]) == ("33", pending["plan_hash"])
+
+
+def test_revision_fences_forced_planning_and_keeps_old_receipt(flow):
+    meeting = start(flow)
+    digest = flow.revise(meeting, "22", SPEC, "Reviewed the export format")
+    submit(flow, claim(flow, meeting), validation(digest, blocking_questions=["Which encoding?"]))
+    flow.approve(meeting, "33", digest, force=True, reason="Accept for this revision")
+    planning = claim(flow, meeting)
+    receipt = flow.show(meeting, "22")["approval"]
+    new_digest = flow.revise(meeting, "22", SPEC + "\nUse UTF-8.", "Resolve the open question")
+    assert flow.jobs.get(planning["id"])["state"] == "CANCELLED"
+    with pytest.raises(ValueError, match="Superseded"):
+        flow.job_context(planning, "muse")
+    assert flow.show(meeting, "22", digest=digest)["approval"] == receipt
+    assert flow.show(meeting, "22")["approval"] is None
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", new_digest, force=True, reason="Validation still pending")
+    assert not flow.github.issues

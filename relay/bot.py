@@ -349,15 +349,20 @@ def create_client(service, *, worker=asyncio.to_thread):
             await _reply(interaction, json.dumps(checked, indent=2, ensure_ascii=False), filename="review.json")
 
     @spec.command(description="Approve a validated revision and publish its generated or uploaded tasks")
+    @app_commands.describe(force="Accept the unresolved findings for this reviewed revision",
+                           reason="Required when accepting unresolved findings")
     @guarded("meetings", approver=True)
     async def approve(interaction: discord.Interaction, meeting: str, digest: str,
-                      tasks: discord.Attachment = None):
-        result = await worker(workflow.approve, meeting, str(interaction.user.id),
-                                         digest, tasks=await attachment_json(tasks))
+                      tasks: discord.Attachment = None, force: bool = False, reason: str = None):
+        actor = str(interaction.user.id)
+        result = await worker(workflow.approve, meeting, actor, digest, tasks=await attachment_json(tasks),
+                              force=force, reason=reason)
+        forced = await worker(workflow.approval_is_forced, meeting, actor, digest)
+        decision = "Force-approved" if forced else "Approved"
         if isinstance(result, str):
-            await _reply(interaction, f"Approved {digest}. Task planning job {result}.")
+            await _reply(interaction, f"{decision} {digest}. Task planning job {result}.")
         else:
-            await after_change(interaction, f"Approved {digest}.\n{_list_tasks(result)}")
+            await after_change(interaction, f"{decision} {digest}.\n{_list_tasks(result)}")
 
     @scope.command(description="List changes that require a human decision")
     @guarded("meetings")

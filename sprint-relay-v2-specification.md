@@ -100,6 +100,7 @@ flowchart TD
     I --> J{重大な未解決事項}
     J -->|あり| E
     J -->|なし| K[人間が最終版を承認]
+    J -->|承認者が残存リスクを確認し理由を記録| K
     K --> L[自動タスク分解・検証]
     L --> M[Issue / Projects 発行]
     M --> N[初期スケジュール]
@@ -117,7 +118,7 @@ flowchart TD
 ### ワークフローの状態
 
 `IMPORTED → MINUTES_READY → DRAFT_READY → HUMAN_REVIEWED → VALIDATING → VALIDATED → APPROVED → PLANNING → PUBLISHING → PUBLISHED`。
-重大指摘は `NEEDS_REVISION` へ、再査読から `VALIDATING` に戻る。技術監査待ちは `WAITING_AUDIT`。外部障害はジョブ側のretry状態で表現し、承認を消さない。仕様が変わるたび旧承認/検証を失効し、公開済みの旧版は履歴に残す。状態遷移はCoreのトランザクションで強制し、AI出力を信用しない。
+重大指摘は `NEEDS_REVISION` へ、再査読から `VALIDATING` に戻る。例外として、承認者は査読・検証済みの現行 digest の指摘を確認し、理由付きで `NEEDS_REVISION` から `APPROVED` に進める。検証レポートと指摘を保存し、承認記録に強制承認フラグと理由を残す。技術監査待ちは `WAITING_AUDIT`。外部障害はジョブ側のretry状態で表現し、承認を消さない。仕様が変わるたび旧承認/検証を失効し、公開済みの旧版は履歴に残す。状態遷移はCoreのトランザクションで強制し、AI出力を信用しない。
 
 ## 6. ユースケースB：定期巡回
 
