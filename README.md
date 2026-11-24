@@ -18,6 +18,10 @@ python -m relay migrate --dry-run --config config.example.toml
 python -m pytest -q
 ```
 
+## Linux へのインストール
+
+初回は `sudo bash deploy/setup.sh`、既存環境の更新は `sudo bash deploy/redeploy.sh` を設置先で実行します。Core、Worker、資格情報と再起動後の検証手順はデプロイガイドにあります。 [デプロイガイド](docs/deployment.md)
+
 ## 運用を始める
 
 1. プライベートな管理リポジトリと開発リポジトリを分けます。管理用資格情報には管理リポジトリの Contents 書き込み、製品用資格情報には対象リポジトリの Contents / Actions 読み取りと Issues 書き込みを許可します。設定した Project に必要な権限も製品用資格情報に付けます。組織横断時は対象リポジトリへの実際のアクセスを確認してください。
