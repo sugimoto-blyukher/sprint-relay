@@ -36,6 +36,8 @@ MANAGEMENT = (
     "Request audits asynchronously; release the current job without waiting for an audit. "
     "Leave scope, dates, owners, approval and completion decisions to humans."
 )
+PROBE_TOOLS = ("get_project_context", "heartbeat_job")
+
 AUDIT = (
     "Read only the assigned get_audit_context snapshot or specification. Review its pinned SHA or "
     "revision for correctness, tests, and consistency. Cite evidence and impact for every finding. "
@@ -124,9 +126,9 @@ def _prompt(req: Launch):
             "Never run commands or tests. " + role_prompt)
 
 
-def _diagnostic(req, provider, code, *, exit_code=None):
+def _diagnostic(req, provider, code, *, exit_code=None, tool=None):
     emit(code, enabled=req.diagnose, job_id=req.job_id, provider=provider, role=req.role,
-         exit_code=exit_code)
+         exit_code=exit_code, tool=tool)
 
 
 async def run_cli(provider, *, job_id, project, role, token, mcp_url, timeout_seconds=600,
@@ -237,8 +239,18 @@ def _arguments(provider, req):
                         "multi_agent_v2", "js_repl", "code_mode", "request_permissions_tool"):
             args.extend(["--disable", feature])
         if req.probe:
+            # Advertise only these two tools directly, even when the selected
+            # model defaults to Code Mode or ordinarily defers MCP tool schemas.
             args.extend(["-c", "mcp_servers.sprintrelay.required=true",
-                         "-c", 'mcp_servers.sprintrelay.enabled_tools=["get_project_context","heartbeat_job"]'])
+                         "-c", f"mcp_servers.sprintrelay.enabled_tools={json.dumps(PROBE_TOOLS)}",
+                         "-c", 'mcp_servers.sprintrelay.omit_tools_from=["deferred","code_mode"]'])
+            # Codex's own interactive tool approval is unavailable under exec.
+            # Approve exactly these operations on the synthetic, leased job.
+            # Server authorization and the challenge still gate completion.
+            for tool in PROBE_TOOLS:
+                args.extend(["-c", f'mcp_servers.sprintrelay.tools.{tool}.approval_mode="approve"'])
+            if req.diagnose:
+                args.append("--json")
         return args + model + ["-"]
     if provider == "claude_code":
         config = {"mcpServers": {"sprintrelay": {"type": "http", "url": req.mcp_url,
@@ -251,18 +263,115 @@ def _arguments(provider, req):
     raise ValueError("Unsupported CLI")
 
 
-async def _invoke(argv, env, prompt=b"", *, diagnostics=False, pass_fds=()):
+def _code_mode_host_warning(message):
+    return (isinstance(message, str) and "codex-code-mode-host" in message.lower()
+            and ("unavailable" in message.lower() or "not found" in message.lower()))
+
+
+class _CodexProbeEvents:
+    """Keep only observations from bounded JSON Lines, never item payloads or IDs."""
+
+    MAX_LINE = 65_536
+
+    def __init__(self, req):
+        self.req = req
+        self.line = bytearray()
+        self.oversized = False
+        self.seen = set()
+        self.agent_message = False
+        self.turn_completed = False
+
+    def record(self, code, tool=None):
+        if (code, tool) not in self.seen:
+            self.seen.add((code, tool))
+            _diagnostic(self.req, "codex", code, tool=tool)
+
+    def feed(self, chunk):
+        lines = chunk.split(b"\n")
+        for part in lines[:-1]:
+            self.append(part)
+            self.end_line()
+        self.append(lines[-1])
+
+    def append(self, data):
+        if self.oversized:
+            return
+        if len(self.line) + len(data) > self.MAX_LINE:
+            self.line.clear()
+            self.oversized = True
+            self.record("CLI_JSON_TRUNCATED")
+        else:
+            self.line.extend(data)
+
+    def end_line(self):
+        if self.line.strip():
+            try:
+                event = json.loads(self.line)
+            except (ValueError, UnicodeError, RecursionError):
+                self.record("CLI_JSON_UNREADABLE")
+            else:
+                self.observe(event)
+        self.line.clear()
+        self.oversized = False
+
+    def observe(self, event):
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        if kind == "turn.started":
+            self.agent_message = False
+            self.turn_completed = False
+        elif kind == "turn.completed":
+            self.turn_completed = True
+            self.record("CLI_TURN_COMPLETED")
+        elif kind in ("turn.failed", "error"):
+            self.record("CLI_TURN_FAILED")
+        elif kind in ("item.started", "item.completed"):
+            item = event.get("item")
+            if not isinstance(item, dict):
+                return
+            if kind == "item.completed":
+                if item.get("type") == "agent_message":
+                    self.agent_message |= isinstance(item.get("text"), str) and bool(item["text"].strip())
+                elif item.get("type") == "error" and _code_mode_host_warning(item.get("message")):
+                    self.record("CODE_MODE_HOST_UNAVAILABLE")
+            if item.get("type") == "mcp_tool_call" and item.get("server") == "sprintrelay":
+                tool = item.get("tool")
+                if tool not in PROBE_TOOLS:
+                    return
+                if kind == "item.started":
+                    self.record("CLI_MCP_CALL_STARTED", tool)
+                elif item.get("status") == "completed":
+                    self.record("CLI_MCP_CALL_COMPLETED", tool)
+                elif item.get("status") == "failed":
+                    self.record("CLI_MCP_CALL_FAILED", tool)
+                    error = item.get("error")
+                    message = error.get("message") if isinstance(error, dict) else None
+                    if isinstance(message, str) and (
+                        "requires approval" in message or "interactive approval is unavailable" in message
+                    ):
+                        self.record("CLI_MCP_APPROVAL_REQUIRED", tool)
+
+    def finish(self):
+        self.end_line()
+        if self.turn_completed:
+            self.record("CLI_FINAL_RESPONSE_PRESENT" if self.agent_message else "CLI_FINAL_RESPONSE_ABSENT")
+
+
+async def _invoke(argv, env, prompt=b"", *, diagnostics=False, pass_fds=(), events=None):
     """Keep bounded diagnostic bytes private; discard agent output and kill all descendants."""
     proc = await asyncio.create_subprocess_exec(
         *argv, env=env, cwd="/", stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE if diagnostics else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE if diagnostics or events else asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE, start_new_session=True, pass_fds=pass_fds)
 
-    async def drain(stream):
+    async def drain(stream, observer=None):
         data = bytearray()
         if stream:
             while chunk := await stream.read(8192):
-                if len(data) < 65_536:
+                if observer:
+                    observer.feed(chunk)
+                elif len(data) < 65_536:
                     data.extend(chunk[:65_536 - len(data)])
         return bytes(data)
 
@@ -271,7 +380,9 @@ async def _invoke(argv, env, prompt=b"", *, diagnostics=False, pass_fds=()):
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             await proc.stdin.drain()
         proc.stdin.close()
-        out, err, status = await asyncio.gather(drain(proc.stdout), drain(proc.stderr), proc.wait())
+        out, err, status = await asyncio.gather(drain(proc.stdout, events), drain(proc.stderr), proc.wait())
+        if events:
+            events.finish()
         return status, out, err
     finally:
         with contextlib.suppress(ProcessLookupError):
@@ -431,9 +542,12 @@ async def _execute_isolated(provider, req, cmd):
         env["SPRINTRELAY_JOB_TOKEN"] = req.token
         prompt = b"" if provider == "antigravity" else _prompt(req).encode()
         _diagnostic(req, provider, "CLI_START")
+        events = _CodexProbeEvents(req) if provider == "codex" and req.diagnose else None
         with _mount_snapshot(cmd, req.snapshot) as (isolated, fds):
-            rc, _, err = await _invoke(isolated + _arguments(provider, req), env, prompt, pass_fds=fds)
+            rc, _, err = await _invoke(isolated + _arguments(provider, req), env, prompt, pass_fds=fds, events=events)
         _diagnostic(req, provider, "CLI_EXIT", exit_code=rc)
+        if req.diagnose and provider == "codex" and _code_mode_host_warning(err.decode(errors="replace")):
+            _diagnostic(req, provider, "CODE_MODE_HOST_UNAVAILABLE")
         detail = _cli_diagnostic(err, "CLI_FAILED" if rc else None)
         if detail:
             _diagnostic(req, provider, detail, exit_code=rc)

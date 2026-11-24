@@ -197,3 +197,46 @@ def test_oauth_signed_jwt_and_sdk(system, keys):
             got = await client.call_tool("get_project_context", {"project_id": system.project})
             assert got.structuredContent["project_id"] == system.project
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(("payload", "code"), [
+    (b'{"jsonrpc":"2.0","id":1,"result":{"tools":[{},{}]}}', "MCP_TOOLS_LIST_RESULT"),
+    (b'{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"SECRET_BODY"}}', "MCP_RPC_ERROR"),
+    (b'{"jsonrpc":"2.0","id":1,"result":{}}', "MCP_RESPONSE_UNCLASSIFIED"),
+])
+def test_probe_observes_chunked_json_rpc_responses_and_http_enum(payload, code, caplog):
+    from http import HTTPStatus
+    from relay.mcp_server import _observe_probe
+
+    async def run():
+        events = [
+            {"type": "http.request", "body": b'{"method":"tools/', "more_body": True},
+            {"type": "http.request", "body": b'list"}'},
+        ]
+        forwarded = []
+
+        async def receive():
+            return events.pop(0)
+
+        async def send(message):
+            forwarded.append(message)
+
+        async def handler(scope, receive, send):
+            await receive()
+            await receive()
+            await send({"type": "http.response.start", "status": HTTPStatus.OK})
+            await send({"type": "http.response.body", "body": payload[:8], "more_body": True})
+            await send({"type": "http.response.body", "body": payload[8:]})
+
+        transport = SimpleNamespace(handle_request=handler)
+        principal = Principal("fixture", "codex", "audit", "owner/repo", "a" * 32,
+                              synthetic_probe=True, diagnose=True)
+        await _observe_probe(transport, principal, {}, receive, send)
+        assert b"".join(event.get("body", b"") for event in forwarded) == payload
+
+    asyncio.run(run())
+    assert "http=200" in caplog.text
+    assert "code=MCP_TOOLS_LIST " in caplog.text and f"code={code} " in caplog.text
+    assert "SECRET_BODY" not in caplog.text
+    if code == "MCP_TOOLS_LIST_RESULT":
+        assert "tools=2" in caplog.text
