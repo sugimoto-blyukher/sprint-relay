@@ -1,0 +1,57 @@
+# Copy to config.toml, then replace every example ID, repository and date.
+[github]
+management_repo = "example/relay-management"
+default_repo = "example/hackathon-product"
+product_repos = ["example/hackathon-product"]
+# Optional Projects v2 node ID, e.g. PVT_... (not the project number).
+project_id = ""
+
+[discord]
+guild_id = "10000"
+approvers = ["10101"]
+
+[discord.channels]
+meetings = "11111"
+tasks = "11112"
+notifications = "11113"
+
+[[members]]
+discord_id = "10101"
+role = "design"
+
+[[members]]
+discord_id = "10102"
+role = "design"
+
+[[members]]
+discord_id = "10103"
+role = "frontend"
+github = "frontend-example"
+
+[[members]]
+discord_id = "10104"
+role = "backend"
+github = "backend-example"
+
+[[members]]
+discord_id = "10105"
+role = "hardware"
+github = "hardware-example"
+
+# Illustrative intervals only. Use explicit offsets when crossing a DST change.
+[calendar]
+timezone = "Asia/Tokyo"
+start = "2030-01-20T09:00:00+09:00"
+end = "2030-01-20T19:00:00+09:00"
+feature_freeze = "2030-01-20T17:00:00+09:00"
+buffer_hours = 0.5
+
+[calendar.milestones]
+demo = "2030-01-20T18:30:00+09:00"
+
+[calendar.availability]
+"10101" = [["2030-01-20T09:00+09:00", "2030-01-20T12:00+09:00"], ["2030-01-20T13:00+09:00", "2030-01-20T18:30+09:00"]]
+"10102" = [["2030-01-20T12:00+09:00", "2030-01-20T18:30+09:00"]]
+"10103" = [["2030-01-20T09:00+09:00", "2030-01-20T12:00+09:00"], ["2030-01-20T13:00+09:00", "2030-01-20T18:30+09:00"]]
+"10104" = [["2030-01-20T09:00+09:00", "2030-01-20T12:00+09:00"], ["2030-01-20T13:00+09:00", "2030-01-20T18:30+09:00"]]
+"10105" = [["2030-01-20T10:00+09:00", "2030-01-20T12:00+09:00"], ["2030-01-20T13:00+09:00", "2030-01-20T17:00+09:00"]]
