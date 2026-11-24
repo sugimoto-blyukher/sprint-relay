@@ -127,7 +127,7 @@ Codex 0.172.0 の追加修正では、合成 Probe の二つの MCP ツールを
 
 ```sh
 sudo journalctl -u sprintrelay.service -u sprintrelay-worker@codex.service \
-  --since '15 minutes ago' --grep 'probe code='
+  --since '15 minutes ago' --grep '(probe|mcp) code='
 ```
 
 | 固定コード | 確認できること |
@@ -148,3 +148,32 @@ sudo journalctl -u sprintrelay.service -u sprintrelay-worker@codex.service \
 | `CLI_EXITED_WITHOUT_MCP_COMPLETION`, `TIMEOUT`, `PROBE_COMPLETED` | 終了コード 0 での未完了、時間切れ、またはリース検証を経た完了 |
 
 CLI 側の分類は既知の診断文言に基づきます。未分類時は Core 側の到達点で判断します。たとえば `tools/list` まで HTTP 200 でツール呼び出しがなければ、列挙以降に調査範囲を絞れます。ログに診断コード、時刻、相関用ジョブ情報、HTTP ステータス、終了コードを出します。認証拒否のログは診断トークンが有効な間だけ頻度制限付きで出します。CLI の生出力やアカウント情報を取得する追加ログ設定は不要です。Probe の成功は SQLite の完了記録で判断します。
+
+### Codex 通常ジョブの更新と受け入れ
+
+Core と Worker が同じリリースになるよう、レビュー済みのチェックアウトで次を実行します。この更新では Worker ソケットで送る起動要求にジョブ種別が加わります。稼働中のジョブは完了を待ってから更新してください。既存の SQLite、systemd ユニットの制約、Squid、CLI アカウントをそのまま使用します。
+
+```sh
+sudo bash deploy/redeploy.sh
+sudo systemctl is-active sprintrelay.service sprintrelay-worker@codex.socket
+sudoedit /etc/sprintrelay/config.toml
+```
+
+既存の `[jobs]` に `job_diagnostics = true` を設定します。Core が設定を再読込した後に起動する Codex 通常ジョブが対象です。合成 Probe は独立した `probe_diagnostics` 設定を使います。通常ジョブに必要な `agents.codex.verified`、プロジェクトの許可、議事録の処理先同意は従来どおり個別に確認します。
+
+1. `/relay status` で両役割の Codex 証跡と稼働状態を確認します。FORMAT で縮退中の場合は、承認者が `/relay retry provider:codex` を使い、必要な役割の Probe 完了を待ちます。この操作の対象は合成 Probe です。
+2. 許可済みの検証用リポジトリで承認者が `/relay patrol` を実行します。ジョブ ID を控え、同じ ID で `get_patrol_delta`、`publish_patrol_report`、`complete_patrol`、`JOB_COMPLETED` を追います。`/relay jobs` の完了、`/relay status` の巡回成功時刻、Core の `relay status --report` にある同じ巡回 ID の報告を照合します。報告本文は非公開の端末で確認してください。
+3. 巡回が検出する検証用 PR を用意し、管理役の `request_audit`、技術監査役の別ジョブ ID で `get_audit_context` と `submit_audit_result`、監査の `COMPLETED` を確認します。監査対象が検証用 PR の head SHA と一致することを照合します。
+4. 検証用会議を `/meeting import` で明示的に Codex に同意して取り込みます。議事録と仕様書の下書き、`/spec revise` 後の検証済み digest、人間の `/spec approve` 後のタスク計画と発行結果を順に確認します。各段階のジョブ ID を控えます。通常ジョブの実アカウント受け入れには、このフローと巡回・監査の完了記録が必要です。[Discord 操作手順](discord.md)
+5. 確認後は `job_diagnostics = false` に戻せます。診断記録にはジョブ ID、役割、プロバイダー、固定コード、許可されたツール名、HTTP ステータスなどの数値だけを使います。
+
+```sh
+sudo journalctl -u sprintrelay.service -u sprintrelay-worker@codex.service \
+  --since '30 minutes ago' --grep '(job|mcp) code='
+sudo -u sprintrelay /opt/sprintrelay/.venv/bin/python -I -m relay status --report \
+  --config /etc/sprintrelay/config.toml --state-dir /var/lib/sprintrelay
+```
+
+`MCP_CATALOG_READY` の件数はサーバーで作成したカタログの件数です。`CLI_MCP_CALL_STARTED` と `tool=` は CLI が選んだ操作を示します。`CLI_MCP_APPROVAL_REQUIRED` は CLI 内の承認による拒否、`MCP_TOOL_UNAUTHORIZED` と `MCP_TOOL_LEASE_LOST` はサーバー側の拒否、`MCP_TOOL_INVALID_INPUT` は契約違反の入力を示します。HTTP 200 でもツールの結果がエラーになる場合があります。`CLI_EXITED_WITHOUT_MCP_COMPLETION` は CLI 正常終了時点でジョブが RUNNING のままだった場合です。大きい JSONL イベントが観測上限を超えた場合は `CLI_JSON_TRUNCATED` とサーバー側の到達記録を併せて確認します。
+
+技術監査で Worker 起動前に証拠の準備が失敗した場合は、権限・リースを示す `AUDIT_SNAPSHOT_DENIED`、版の競合などを示す `AUDIT_SNAPSHOT_INVALID`、外部読み取り障害を示す `AUDIT_SNAPSHOT_DEPENDENCY_FAILED` を確認します。未認証要求の `MCP_AUTH_REJECTED` はジョブを特定できないため `mcp code=` で記録します。

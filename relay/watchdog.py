@@ -29,10 +29,14 @@ class Watchdog:
                 error = "TRANSIENT"
             # Only a transactionally validated MCP submission can complete work.
             state = (await self.worker(self.store.get, job["id"]))["state"]
-            if job.get("kind") == "probe" and self.store.config.jobs.probe_diagnostics:
-                code = "PROBE_COMPLETED" if state == "COMPLETED" else "CLI_EXITED_WITHOUT_MCP_COMPLETION"
-                if state == "COMPLETED" or error is None:
-                    emit(code, enabled=True, job_id=job["id"], provider=job["provider"], role=job["role"])
+            probe = job.get("kind") == "probe"
+            enabled = (self.store.config.jobs.probe_diagnostics if probe else
+                       job["provider"] == "codex" and self.store.config.jobs.job_diagnostics)
+            if state == "COMPLETED" or (error is None and state == "RUNNING"):
+                code = "CLI_EXITED_WITHOUT_MCP_COMPLETION"
+                if state == "COMPLETED":
+                    code = "PROBE_COMPLETED" if probe else "JOB_COMPLETED"
+                emit(code, enabled=enabled, job_id=job["id"], provider=job["provider"], role=job["role"], probe=probe)
             if state == "RUNNING":
                 await self.worker(self.store.fail, job["id"], job["provider"], job["lease_token"],
                                   error or "FORMAT", retry_after=getattr(error, "retry_after", None))

@@ -7,7 +7,7 @@
 | GitHub | The development repository connection read source and submitted the v1 delivery. Runtime tests use synthetic REST/GraphQL fixtures. | Runtime management/product credentials, Projects and two-way sync require a deployment smoke test. |
 | Discord | The test suite registers guild commands with discord.py and invokes callbacks using synthetic interactions. An unauthenticated GET to the Gateway endpoint from the implementation environment returned HTTP 403. | Live bot authentication, server permissions and delivery are unverified. |
 | Muse personal agent | Meta documents custom connectors and scheduled tasks. | Unverified until an authorized account completes a synthetic authenticated MCP call during a 45-minute schedule. |
-| Codex CLI | The implementation environment provided `codex-cli 0.172.0-alpha.2`; its `exec --help` output was inspected. | Account login, isolated noninteractive operation and the scoped MCP round trip are unverified. |
+| Codex CLI | Official 0.172.0 exercised against scripted loopback inference with real MCP and SQLite for probes and project jobs. | The operator confirmed both role probes on the Linux deployment. Live completion of regular Codex jobs is pending. |
 | Claude Code / Antigravity | Official CLI and MCP documentation reviewed. Executables were absent in the implementation environment. | Optional and unverified. |
 
 Use synthetic data and an explicitly authorized account for acceptance test A17. Record CLI version, verified flags, transport, target project, successful structured MCP submission and the observed failure/timeout behavior. Keep tokens and account-identifying output out of the record.

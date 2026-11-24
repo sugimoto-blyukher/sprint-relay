@@ -78,7 +78,8 @@ def test_sdk_auditor_role_visibility_and_terminal_violation(system):
     async def run():
         async with connection(app, token) as client:
             tools = (await client.list_tools()).tools
-            assert {t.name for t in tools} == ALLOWED["audit"]
+            assert {t.name for t in tools} == {
+                "get_project_context", "heartbeat_job", "report_job_failure", "get_audit_context", "submit_audit_result"}
             assert all(t.outputSchema and t.inputSchema["additionalProperties"] is False for t in tools)
             args = {"project_id": system.project}
             context = await client.call_tool("get_project_context", args)
@@ -240,3 +241,22 @@ def test_probe_observes_chunked_json_rpc_responses_and_http_enum(payload, code, 
     assert "SECRET_BODY" not in caplog.text
     if code == "MCP_TOOLS_LIST_RESULT":
         assert "tools=2" in caplog.text
+
+
+def test_codex_lease_cannot_call_another_management_workflow_tool(system):
+    job, lease, app, token, *_ = local(system, "minutes")
+
+    async def run():
+        async with connection(app, token) as client:
+            catalog = (await client.list_tools()).tools
+            assert {t.name for t in catalog} == {"get_project_context", "heartbeat_job", "report_job_failure",
+                                                  "get_transcript", "submit_minutes"}
+            # Construct a valid same-role call, bypassing the CLI's list and approval filters.
+            denied = await client.call_tool("publish_patrol_report", {
+                "project_id": system.project, "job_id": job, "lease_token": lease,
+                "summary": "SECRET_SUMMARY", "references": []})
+            assert denied.isError and denied.structuredContent["code"] == "UNAUTHORIZED"
+            assert system.jobs.get(job)["state"] == "FAILED"
+            assert not (await client.list_tools()).tools
+
+    asyncio.run(run())

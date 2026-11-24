@@ -7,7 +7,7 @@ from hmac import compare_digest
 from pydantic import ValidationError
 
 from .github import Conflict, GitHubError, digest
-from .mcp_contracts import ALLOWED, T
+from .mcp_contracts import ALLOWED, PROBE_TOOLS, T, codex_tools
 from .mcp_server import BoundaryError
 from .schedule import recalculate
 
@@ -25,12 +25,27 @@ FAILURES = {"invalid_input": "INPUT", "permission": "PERMISSION", "conflict": "C
             "dependency": "DEPENDENCY", "invalid_output": "FORMAT"}
 
 
+def _codex_catalog(bound):
+    spec_audit = bound["kind"] == "audit" and bound["payload"].get("kind") == "spec"
+    return codex_tools(bound["role"], bound["kind"], spec_audit=spec_audit)
+
+
 class Gateway:
     def __init__(self, project, config, jobs, workflow, patrol, registry, github):
         if project != config.management_repo:
             raise ValueError("MCP project must match the configured management repository")
         self.project, self.config, self.jobs = project, config, jobs
         self.workflow, self.patrol, self.github = workflow, patrol, github
+
+    def catalog(self, p):
+        if p.provider == "codex":
+            bound = self._lease(p, p.job_id, p.lease_token)
+            if bound["project"] != p.project or bound["role"] != p.role:
+                raise BoundaryError("UNAUTHORIZED")
+            return _codex_catalog(bound)
+        if p.synthetic_probe:
+            return PROBE_TOOLS
+        return ALLOWED[p.role]
 
     def _job(self, p, id, *, audit_reference=False):
         if p.job_id and p.job_id != id and not (audit_reference and p.role == "management"):
@@ -99,6 +114,8 @@ class Gateway:
                 if assigned["kind"] != "probe" and p.provider not in self.config.privacy.project_providers:
                     raise BoundaryError("UNAUTHORIZED")
                 bound = self._lease(p, p.job_id, p.lease_token)
+                if p.provider == "codex" and name not in _codex_catalog(bound):
+                    raise BoundaryError("UNAUTHORIZED")
                 if a.get("job_id", p.job_id) != p.job_id:
                     raise BoundaryError("UNAUTHORIZED")
             elif p.provider != "muse" or p.role != "management":

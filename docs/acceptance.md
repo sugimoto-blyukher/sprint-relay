@@ -20,7 +20,7 @@ Run `python -m pytest -q` from the repository root with the test extra installed
 | A14 | `test_mcp_server.py`, `test_ai.py`, `test_patrol.py`: synthetic injected instructions, consent revocation, controlled public content and evidence-bound actions. |
 | A15 | `test_jobs.py`, `test_e2e.py`: all providers offline, human task operations, schedule rendering/sync and recovery of pending work. |
 | A16 | `test_cli.py`, `test_workflow.py`: actual SQLite dry-run, upgrade/re-run, legacy approval and history, verified backup and restore. |
-| A17 | Live deployment exercise. The authorized development GitHub connection and Codex CLI help were checked. Vendor login, model-backed CLI/MCP calls, Muse scheduling, operational GitHub and Discord remain unverified. |
+| A17 | Live deployment exercise. The authorized development GitHub connection and Codex CLI help were checked. The operator confirmed both synthetic Codex probes in production. Live regular Codex jobs and scheduled Muse interoperability still require acceptance. |
 
 ## A17 synthetic deployment exercise
 
@@ -29,3 +29,6 @@ Run `python -m pytest -q` from the repository root with the test extra installed
 3. Install the Muse connector using the configured HTTPS resource and exact OAuth identity. Observe two actual scheduled callbacks 45 minutes apart; record their timestamps. Simulate one missed slot and verify that the fallback cannot steal an active lease. Restore access and verify that the next safe slot uses the preferred provider.
 4. Run the meeting workflow with that fixture, review the final digest, approve it, and inspect the linked Issue and Project item. Use a Discord-only designer to claim work and submit an artifact. Verify the notification and a PR review tied to a specific head SHA on the fixture repository. [Discord guide](discord.md)
 5. Remove test access and verify that the service continues human task management and forecasting. Keep a sanitized record of passes, denials, timeouts and outstanding account-specific limitations. Enable only the clients that passed under the target deployment's policy.
+
+
+The Codex project-job regression runs a patrol, its PR audit, and an imported meeting through draft, human review, validation, approval and planning. The native test uses the official 0.172.0 executable, scripted loopback inference and a synthetic GitHub transport. Set `SPRINTRELAY_TEST_CODEX` to run it locally. [Native regression](../tests/test_codex_jobs.py) · [Live acceptance](deployment.md#codex-通常ジョブの更新と受け入れ)

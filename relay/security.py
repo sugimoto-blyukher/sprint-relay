@@ -33,8 +33,8 @@ class TokenVault:
         self._lock = threading.Lock()
 
     def issue(self, principal: Principal, ttl: int = 600, *, lease_token: str) -> str:
-        if principal.diagnose and not principal.synthetic_probe:
-            raise ValueError("Diagnostics require a synthetic probe")
+        if principal.diagnose and not principal.synthetic_probe and principal.provider != "codex":
+            raise ValueError("Normal job diagnostics require Codex")
         if not principal.job_id or not lease_token or not 1 <= ttl <= 3600:
             raise ValueError("Local access requires a bounded lifetime and a specific leased job")
         if principal.role not in {"management", "audit"} or not principal.subject:
