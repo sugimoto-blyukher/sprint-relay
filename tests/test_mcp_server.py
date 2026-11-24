@@ -260,3 +260,112 @@ def test_codex_lease_cannot_call_another_management_workflow_tool(system):
             assert not (await client.list_tools()).tools
 
     asyncio.run(run())
+
+
+def test_job_input_budget_is_shared_fenced_and_durable(system):
+    from concurrent.futures import ThreadPoolExecutor
+
+    job, lease, _, token, vault, _ = local(system, "minutes")
+    principal = vault.verify(token)
+    args = dict(project_id=system.project, job_id=job, lease_token=lease)
+    before = system.jobs.get(job)
+
+    def rejected(name, payload):
+        with pytest.raises(BoundaryError) as caught:
+            system.dispatch(name, principal, payload)
+        return caught.value
+
+    # No counter or lease mutation may be triggered using an invalid argument credential.
+    assert rejected("submit_minutes", args | {"lease_token": "stale", "minutes": None}).code == "LEASE_LOST"
+    first = rejected("submit_minutes", args | {"minutes": {"PRIVATE_NESTED_KEY": True}})
+    assert (first.code, first.field, first.remaining) == ("INVALID_INPUT", "minutes", 2)
+    assert system.dispatch("get_transcript", principal, args)["source"] == "message-1"
+    active = system.jobs.get(job)
+    assert (active["lease_until"], active["attempts"], active["fence_generation"]) == (
+        before["lease_until"], before["attempts"], before["fence_generation"])
+
+    # A restarted Core and a different tool still share the original correction budget.
+    system.jobs = JobStore(system.jobs.path, system.config)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        errors = list(pool.map(lambda _: rejected("get_transcript", args | {"PRIVATE_UNKNOWN": "PRIVATE_VALUE"}),
+                               range(2)))
+    assert {(e.code, e.field, e.reason, e.remaining) for e in errors} == {
+        ("INVALID_INPUT", "arguments", "UNKNOWN_FIELD", 1), ("INPUT_LIMIT", "arguments", "UNKNOWN_FIELD", 0)}
+    terminal = system.jobs.get(job)
+    assert (terminal["state"], terminal["error_class"]) == ("FAILED", "INPUT")
+    assert rejected("get_transcript", args).code == "LEASE_LOST"
+    with system.jobs.transaction(write=False) as db:
+        assert db.execute("SELECT COUNT(*) FROM audit_log WHERE job_id=? AND operation='finish'", (job,)).fetchone()[0] == 1
+
+
+def test_schema_error_metadata_over_mcp_is_allowlisted(system, caplog):
+    from dataclasses import replace
+
+    job, lease, app, original, vault, _ = local(system, "minutes")
+    p = replace(vault.verify(original), diagnose=True)
+    token = vault.issue(p, lease_token=lease)
+
+    async def run():
+        async with connection(app, token) as client:
+            args = dict(project_id=system.project, job_id=job, lease_token=lease)
+            bad = await client.call_tool("get_transcript", args | {"PRIVATE_EXTRA_KEY": "PRIVATE_ARGUMENT"})
+            assert bad.isError
+            detail = bad.structuredContent
+            assert (detail["field"], detail["reason"], detail["remaining_submissions"]) == (
+                "arguments", "UNKNOWN_FIELD", 2)
+            assert "field=arguments reason=UNKNOWN_FIELD" in caplog.text
+            assert all(value not in str(bad) + caplog.text for value in (
+                "PRIVATE_EXTRA_KEY", "PRIVATE_ARGUMENT", token, original, lease))
+            # Combining a wrong job scope with an invalid payload is a terminal permission violation.
+            denied = await client.call_tool("submit_minutes", args | {"job_id": "other", "minutes": {}})
+            assert denied.isError and denied.structuredContent["code"] == "UNAUTHORIZED"
+            assert system.jobs.get(job)["error_class"] == "PERMISSION"
+    asyncio.run(run())
+
+
+def test_public_constraints_match_domain_limits():
+    from pydantic import ValidationError
+    from relay.mcp_contracts import T
+    from relay.workflow import MAX_TEXT
+
+    report = T["publish_patrol_report"][0]
+    inputs = dict(project_id="owner/repo", job_id="fixture", lease_token="fixture", summary="Done")
+    assert report.model_json_schema()["properties"]["references"]["maxItems"] == 50
+    report.model_validate(inputs | {"references": ["change"] * 50})
+    for update in ({"references": ["change"] * 51}, {"references": [], "summary": " \n "},
+                   {"references": [], "summary": "test\0summary"}):
+        with pytest.raises(ValidationError):
+            report.model_validate(inputs | update)
+
+    spec = T["submit_specification"][0].model_json_schema()["properties"]
+    assert spec["markdown"]["maxLength"] == MAX_TEXT and spec["evidence"]["minItems"] == 1
+    proposal = T["submit_task_plan"][0].model_json_schema()["$defs"]["TaskProposal"]["properties"]
+    assert all(proposal[name]["minItems"] == 1 for name in ("requirement_ids", "deliverables", "acceptance"))
+
+
+def test_expiry_before_correction_cannot_revive_a_lease(system):
+    job, lease, _, token, vault, _ = local(system, "minutes")
+    args = dict(project_id=system.project, job_id=job, lease_token=lease)
+    with pytest.raises(BoundaryError, match="INVALID_INPUT"):
+        system.dispatch("get_transcript", vault.verify(token), args | {"extra": True})
+    deadline = system.jobs.get(job)["lease_until"]
+    system.jobs.clock = lambda: deadline
+    for payload in (args, args | {"extra": True}):
+        with pytest.raises(BoundaryError, match="LEASE_LOST"):
+            system.dispatch("get_transcript", vault.verify(token), payload)
+    with system.jobs.transaction(write=False) as db:
+        assert db.execute("SELECT failures FROM job_input_errors WHERE job_id=?", (job,)).fetchone()[0] == 1
+        assert system.jobs.get(job, db)["lease_until"] == deadline
+
+
+def test_remote_muse_spends_only_a_verified_argument_lease(system):
+    p = Principal("remote-fixture", "muse", "management", system.project)
+    job = system.jobs.enqueue(system.project, "minutes", "management", "meeting", {}, ["muse"])
+    claim = system.jobs.claim(job, "muse")
+    args = dict(project_id=system.project, job_id=job, lease_token=claim["lease_token"])
+    with pytest.raises(BoundaryError, match="LEASE_LOST"):
+        system.dispatch("submit_minutes", p, args | {"lease_token": "foreign", "minutes": {}})
+    with pytest.raises(BoundaryError, match="INVALID_INPUT") as caught:
+        system.dispatch("submit_minutes", p, args | {"minutes": {}})
+    assert caught.value.remaining == 2
+    assert system.dispatch("get_transcript", p, args)["source"] == "message-1"

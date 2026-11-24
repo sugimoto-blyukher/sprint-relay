@@ -13,6 +13,7 @@ import time
 import threading
 from urllib.parse import quote, urlencode
 
+from .mcp_contracts import InputProblem, REPORT_REFERENCE_LIMIT
 from .github import Conflict, GitHubError, digest
 
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -198,7 +199,7 @@ class Patrol:
             conn.execute("UPDATE patrol_scan SET completed_audits=? WHERE id=?", (json_data(visible), patrol_id))
             items = json.loads(row["changes"])
             if cursor > row["seen"] or cursor > len(items):
-                raise ValueError("Patrol pages must be read in order")
+                raise InputProblem("cursor", "VALUE")
             stop = min(cursor + limit, len(items))
             conn.execute("UPDATE patrol_scan SET seen=MAX(seen,?) WHERE id=?", (stop, patrol_id))
             open_tasks = [t for t in tasks if t.status not in {"Done", "Cancelled"}]
@@ -359,7 +360,7 @@ class Patrol:
         with self._db(db) as conn:
             row = self._audit(conn, job_id)
             if row["evidence"] is None:
-                raise ValueError("Read the assigned audit context first")
+                raise InputProblem("findings", "READ_CONTEXT_FIRST")
             assigned = json.loads(row["input"])
             self._consent(assigned, provider)
             anchors = {item["id"]: item for item in json.loads(row["evidence"])}
@@ -372,13 +373,13 @@ class Patrol:
                 anchor = anchors.get(finding["evidence_id"])
                 if (not anchor or finding["category"] not in CATEGORIES or
                         finding["severity"] not in ("low", "medium", "high")):
-                    raise ValueError("Unknown audit evidence, category or severity")
+                    raise InputProblem("findings", "UNKNOWN_REFERENCE")
                 for key in ("summary", "impact", "acceptance"):
                     bounded(finding[key], key, 600)
                 fingerprint = digest([assigned["repo"], assigned["kind"], assigned["target"],
                                       anchor["path"], finding["category"]])
                 if fingerprint in ids:
-                    raise ValueError("Duplicate finding at this evidence location")
+                    raise InputProblem("findings", "DUPLICATE")
                 ids.add(fingerprint)
                 clean.append({**finding, "finding_id": fingerprint, "path": anchor["path"],
                               "evidence_url": anchor["url"]})
@@ -470,7 +471,7 @@ class Patrol:
             assigned, _ = self._finding(conn, job_id, finding_id, provider)
             records, sha = self.github._load()
             if task_id not in records:
-                raise ValueError("Unknown task")
+                raise InputProblem("task_id", "UNKNOWN_REFERENCE")
             from .core import Task
             record = records[task_id]
             task = Task.from_dict(record["task"])
@@ -492,13 +493,13 @@ class Patrol:
 
     def report(self, patrol_id, summary, references, *, provider, check, db=None):
         bounded(summary, "patrol summary", 2048)
-        if not isinstance(references, list) or len(references) > 50:
+        if not isinstance(references, list) or len(references) > REPORT_REFERENCE_LIMIT:
             raise ValueError("Invalid patrol references")
         with self._db(db) as conn:
             row = conn.execute("SELECT changes, completed_audits FROM patrol_scan WHERE project=? AND id=?",
                                (self.project, patrol_id)).fetchone()
             if not row:
-                raise ValueError("Read the patrol snapshot first")
+                raise InputProblem("references", "READ_CONTEXT_FIRST")
             audits = json.loads(row["completed_audits"])
             changes = json.loads(row["changes"])
             items = {item["id"] for item in changes}
@@ -506,7 +507,7 @@ class Patrol:
                 if ref in audits:
                     self.audit_result(ref, provider=provider, db=conn)
                 elif ref not in items:
-                    raise ValueError("Report references must identify items in the patrol snapshot")
+                    raise InputProblem("references", "UNKNOWN_REFERENCE")
             key = "patrol:" + patrol_id
             # Discord task channels can have a wider audience than a meeting.
             text = (f"SprintRelay patrol: {len(changes)} changed items, {len(audits)} completed audits, "

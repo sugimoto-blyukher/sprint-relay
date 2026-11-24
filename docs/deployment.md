@@ -177,3 +177,22 @@ sudo -u sprintrelay /opt/sprintrelay/.venv/bin/python -I -m relay status --repor
 `MCP_CATALOG_READY` の件数はサーバーで作成したカタログの件数です。`CLI_MCP_CALL_STARTED` と `tool=` は CLI が選んだ操作を示します。`CLI_MCP_APPROVAL_REQUIRED` は CLI 内の承認による拒否、`MCP_TOOL_UNAUTHORIZED` と `MCP_TOOL_LEASE_LOST` はサーバー側の拒否、`MCP_TOOL_INVALID_INPUT` は契約違反の入力を示します。HTTP 200 でもツールの結果がエラーになる場合があります。`CLI_EXITED_WITHOUT_MCP_COMPLETION` は CLI 正常終了時点でジョブが RUNNING のままだった場合です。大きい JSONL イベントが観測上限を超えた場合は `CLI_JSON_TRUNCATED` とサーバー側の到達記録を併せて確認します。
 
 技術監査で Worker 起動前に証拠の準備が失敗した場合は、権限・リースを示す `AUDIT_SNAPSHOT_DENIED`、版の競合などを示す `AUDIT_SNAPSHOT_INVALID`、外部読み取り障害を示す `AUDIT_SNAPSHOT_DEPENDENCY_FAILED` を確認します。未認証要求の `MCP_AUTH_REJECTED` はジョブを特定できないため `mcp code=` で記録します。
+
+### 巡回報告の入力訂正
+
+`publish_patrol_report.references` は同じ巡回の `get_patrol_delta` が返す `changes[].id` と `completed_audits[]` の文字列から選びます。上限は合計50件で、引用がなければ `[]` を渡します。`snapshot_cursor` は報告後の `complete_patrol` に渡します。
+
+有効なリースで修正可能な入力を拒否すると、MCP は `INVALID_INPUT` と `field`、`reason`、`remaining_submissions` を返します。たとえば `field=references reason=TYPE` は型の不一致、`LIMIT` は件数・長さなどの上限または下限違反、`UNKNOWN_REFERENCE` はスナップショットとの不一致です。フィールド名はスキーマで宣言済みの最上位名に限定し、未定義のキーは `arguments` と表示します。
+
+一つのジョブにつき最初と2回目の入力エラーは訂正でき、3回目に `INPUT_LIMIT` でジョブを `FAILED / INPUT` にします。回数は SQLite に記録し、ツールの変更、成功した中間呼び出し、接続し直し、Core の再起動をまたいで共有します。訂正によるリース延長はありません。すでに終了したジョブへの再送は `LEASE_LOST` です。権限違反と、人間の確認が必要なジョブ入力の異常には従来の終了処理を使います。
+
+**既存Linuxサーバーへの反映と確認**
+
+1. `/relay jobs` で実行中の作業が完了したことを確認し、レビュー済みソースから `sudo bash deploy/redeploy.sh` を実行します。既存スクリプトが状態をバックアップし、Core と Worker を更新します。Core 起動時に入力エラー回数用テーブルを追加します。SQLite の手動編集や systemd・Squid の設定変更は不要です。
+2. 既存の `[jobs]` で `job_diagnostics = true` を有効にします。先の巡回が `FAILED` なら承認者が `/relay patrol` で新しい巡回を要求し、そのジョブ ID を控えます。既存の失敗履歴は残ります。
+3. 次のコマンドで同じジョブ ID の `publish_patrol_report`、`complete_patrol`、`JOB_COMPLETED` を確認します。訂正が起きた場合は `MCP_TOOL_INVALID_INPUT` の後に同じジョブで提出が成功しているかを確認します。別途 `/relay jobs` の完了、直近の巡回報告と巡回成功時刻も照合します。運用ログには入力値や生の CLI 出力を追加しないでください。
+
+```sh
+sudo journalctl -u sprintrelay.service -u sprintrelay-worker@codex.service \
+  --since '30 minutes ago' --grep 'job code='
+```

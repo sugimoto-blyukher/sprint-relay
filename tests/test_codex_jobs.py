@@ -10,7 +10,7 @@ from relay.gateway import Gateway
 from relay.github import GitHub
 from relay.jobs import JobStore
 from relay.mcp_contracts import ALLOWED, T, TOOL_DESCRIPTIONS, codex_tools
-from relay.mcp_server import create_app
+from relay.mcp_server import BoundaryError, create_app
 from relay.patrol import Patrol
 from relay.security import Principal, TokenVault
 from relay.worker import Launch
@@ -37,6 +37,9 @@ def project_calls(kind, project):
         audit = yield "request_audit", args | dict(kind="pr", repo="owner/product", target="8",
                                                     sha=HEAD, question="Check coverage")
         assert audit["job_id"]
+        correction = yield "publish_patrol_report", args | dict(summary="PRIVATE_REPORT", references="PRIVATE_WRONG")
+        assert correction["code"] == "INVALID_INPUT" and correction["remaining_submissions"] == 2
+        assert (correction["field"], correction["reason"]) == ("references", "TYPE")
         report = yield "publish_patrol_report", args | dict(summary="PRIVATE_REPORT", references=refs)
         assert report["receipt"] == "patrol:" + args["job_id"]
         checkpoint = yield "complete_patrol", args | {"snapshot_cursor": page["snapshot_cursor"]}
@@ -142,12 +145,16 @@ def test_patrol_audit_and_reviewed_meeting(tmp_path, caplog, native):
                 except StopIteration:
                     break
                 assert name in gateway.catalog(p)
-                result = gateway.dispatch(name, p, arguments)
+                try:
+                    result = gateway.dispatch(name, p, arguments)
+                except BoundaryError as exc:
+                    assert exc.code == "INVALID_INPUT"
+                    result = dict(code=exc.code, field=exc.field, reason=exc.reason, remaining_submissions=exc.remaining)
         vault.revoke(token)
         assert jobs.get(job_id)["state"] == "COMPLETED"
         assert all(secret not in caplog.text for secret in (
             token, job["lease_token"], TRANSCRIPT, SPEC, INJECT, "PRIVATE_MINUTES", "PRIVATE_REPORT",
-            "PRIVATE_FINDING", "PRIVATE_FIXTURE_ANSWER"))
+            "PRIVATE_FINDING", "PRIVATE_WRONG", "PRIVATE_FIXTURE_ANSWER"))
 
     def run(kind, job_id):
         asyncio.run(exercise(kind, job_id))

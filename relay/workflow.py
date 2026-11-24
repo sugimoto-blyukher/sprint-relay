@@ -16,11 +16,13 @@ from pathlib import Path
 
 from .ai import Minutes, Review, TaskPlan
 from .core import Task, new_task, validate_tasks
+from .github import Conflict
+from .mcp_contracts import DOCUMENT_LIMIT, InputProblem
 
 CHECKS = ("technical", "logical", "cross_team", "completeness", "feasibility", "traceability")
 MINUTES = ("proposals", "decisions", "open_questions")
 REQUIREMENT = re.compile(r"\bREQ-[0-9]+\b")
-MAX_TEXT = 120_000
+MAX_TEXT = DOCUMENT_LIMIT
 
 
 def _json(value):
@@ -461,7 +463,14 @@ class Workflow:
         data = tasks
         if agent:
             data = TaskPlan.model_validate({"tasks": tasks}).model_dump(exclude_none=True)["tasks"]
-        plan = self._plan(rev["markdown"], data, initial=not row["published"])
+        try:
+            plan = self._plan(rev["markdown"], data, initial=not row["published"])
+        except Conflict:
+            raise
+        except ValueError:
+            if agent:
+                raise InputProblem("tasks", "VALUE") from None
+            raise
         if agent and any(not self.github.is_private(repo) for repo in {t.repo for t in plan}):
             raise PermissionError("A public product repository requires a human-checked public task plan")
         if row["published"]:
@@ -660,8 +669,10 @@ class Workflow:
         kind, meeting = job["kind"], row["id"]
         if kind == "minutes":
             minutes = Minutes.model_validate(data["minutes"]).model_dump()
-            if not self._raw_available(row) or any(d["quote"] not in row["transcript"] for d in minutes["decisions"]):
-                raise ValueError("Decisions require an exact quote from the available transcript")
+            if not self._raw_available(row):
+                raise ValueError("Transcript retention period expired")
+            if any(d["quote"] not in row["transcript"] for d in minutes["decisions"]):
+                raise InputProblem("minutes", "UNKNOWN_REFERENCE")
             minutes.update(meeting_id=meeting, source=row["source"])
             db.execute("UPDATE workflow_v2 SET minutes=? WHERE meeting=?", (_json(minutes), meeting))
             self._queue(db, row, "specification")
