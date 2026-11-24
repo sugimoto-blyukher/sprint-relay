@@ -90,7 +90,7 @@ class ContextOut(Record):
     roles: list[str]
     constraints: list[str]
     job: dict[str, str] | None = None
-    probe: dict[str, str] | None = None
+    probe: dict[str, str | float] | None = None
 
 
 class JobSummary(Record):
@@ -137,7 +137,7 @@ def inp(name, base, **fields):
 # Dynamic field lists keep the small command contracts auditable together. The
 # public JSON schemas include required fields, enum values and wire limits.
 T = {
-    "get_project_context": (Project, ContextOut),
+    "get_project_context": (inp("ProjectContext", Project, probe_answer=(Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")] | None, None)), ContextOut),
     "list_workflow_jobs": (inp("ListJobs", Project, cursor=(ID | None, None), limit=(Limit, 50),
                                kinds=(list[Kind], [])), out("Jobs", jobs=list[JobSummary], next_cursor=str | None)),
     "claim_job": (Job, LeaseOut),

@@ -9,9 +9,11 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import time
+import threading
 from urllib.parse import quote, urlencode
 
-from .github import Conflict, digest
+from .github import Conflict, GitHubError, digest
 
 SHA = re.compile(r"[0-9a-f]{40}")
 REVISION = re.compile(r"[0-9a-f]{64}")
@@ -47,6 +49,19 @@ def json_data(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def latest_report(db, project, retention_days, *, now=None):
+    """Read a current private operator report without opening a writer connection."""
+    if type(retention_days) is not int or not 1 <= retention_days <= 365:
+        raise ValueError("Invalid report retention")
+    cutoff = (time.time() if now is None else now) - retention_days * 86400
+    row = db.execute("""SELECT id, created, data FROM artifacts WHERE project=? AND kind='patrol_report'
+                        AND created>=? AND data!='null' ORDER BY created DESC, rowid DESC LIMIT 1""",
+                     (project, cutoff)).fetchone()
+    if row is None:
+        return None
+    return {"receipt": row[0], "created": row[1], **json.loads(row[2])}
+
+
 class Patrol:
     def __init__(self, config, github, jobs, path, *, workflow=None, now=None):
         self.config = config
@@ -55,6 +70,7 @@ class Patrol:
         self.project = config.management_repo
         self.workflow = workflow
         self.path = Path(path)
+        self._outbound_lock = threading.Lock()
         self.now = now or (lambda: datetime.now(timezone.utc))
         with self._db() as db:
             db.executescript("""
@@ -108,7 +124,14 @@ class Patrol:
             page = 1
             while True:
                 query = urlencode({"per_page": 100, "page": page})
-                runs = self.github.request("GET", root + "/actions/runs?" + query)["workflow_runs"]
+                try:
+                    runs = self.github.request("GET", root + "/actions/runs?" + query)["workflow_runs"]
+                except GitHubError as exc:
+                    if page != 1 or exc.status not in {403, 404}:
+                        raise
+                    records["ci-access:" + repo] = dict(kind="availability", repo=repo,
+                                                        target="actions", state="unavailable")
+                    break
                 for run in runs:
                     if run.get("conclusion") == "failure":
                         key = f"ci:{repo}:{run['id']}"
@@ -137,8 +160,12 @@ class Patrol:
                 prior = conn.execute("""SELECT items FROM patrol_scan WHERE project=? AND finished=1
                                         ORDER BY rowid DESC LIMIT 1""", (self.project,)).fetchone()
                 previous = json.loads(prior[0]) if prior else {}
-                changes = [v for k, v in sorted(current.items()) if previous.get(k) != v]
-                changes.extend(dict(previous[k], removed=True) for k in sorted(previous.keys() - current.keys()))
+                for k, old in previous.items():
+                    if old["kind"] == "ci" and "ci-access:" + old["repo"] in current:
+                        current.setdefault(k, old)
+                changes = [dict(v, id=digest([k, v])[:24]) for k, v in sorted(current.items()) if previous.get(k) != v]
+                changes.extend(dict(previous[k], id=digest(["removed", k, previous[k]])[:24], removed=True)
+                               for k in sorted(previous.keys() - current.keys()))
                 # A result is acknowledged by finishing a patrol that actually returned it.
                 acknowledged = set()
                 for past in conn.execute("SELECT completed_audits FROM patrol_scan WHERE project=? AND finished=1",
@@ -160,6 +187,15 @@ class Patrol:
                              (patrol_id, self.project, checkpoint, json_data(current), json_data(changes),
                               json_data(audits)))
                 row = conn.execute("SELECT * FROM patrol_scan WHERE id=?", (patrol_id,)).fetchone()
+            # A replacement manager can have a narrower set of meeting consents.
+            visible = []
+            for audit_id in json.loads(row["completed_audits"]):
+                try:
+                    self._consent(json.loads(self._audit(conn, audit_id)["input"]), provider)
+                except (PermissionError, ValueError):
+                    continue
+                visible.append(audit_id)
+            conn.execute("UPDATE patrol_scan SET completed_audits=? WHERE id=?", (json_data(visible), patrol_id))
             items = json.loads(row["changes"])
             if cursor > row["seen"] or cursor > len(items):
                 raise ValueError("Patrol pages must be read in order")
@@ -173,7 +209,7 @@ class Patrol:
             if self.workflow:
                 pending.extend(self.workflow.pending_for(provider))
             return dict(changes=items[cursor:stop], next_cursor=stop if stop < len(items) else None,
-                        snapshot_cursor=row["cursor"], pending_jobs=pending, completed_audits=json.loads(row["completed_audits"]),
+                        snapshot_cursor=row["cursor"], pending_jobs=pending, completed_audits=visible,
                         overdue=sorted(t.key for t in open_tasks if t.deadline and datetime.fromisoformat(t.deadline) < now),
                         blocked=sorted(t.key for t in open_tasks if t.status == "Blocked"),
                         remaining_hours={t.key: t.remaining_hours for t in open_tasks})
@@ -277,7 +313,7 @@ class Patrol:
                 else:
                     route = f"/repos/{repo}/compare/{assigned['base']}...{sha}"
                 files = self.github.request("GET", route).get("files", [])
-                truncated = False
+                truncated = not files
                 for file in files:
                     path = file.get("filename", "")
                     if (not isinstance(path, str) or len(path) > 220 or not path.isascii() or
@@ -300,6 +336,22 @@ class Patrol:
             conn.execute("UPDATE patrol_audit SET evidence=? WHERE job=?", (json_data(anchors), job_id))
             return {**{k: assigned[k] for k in ("kind", "repo", "target", "sha", "question")},
                     "job_id": job_id, "evidence": evidence, "truncated": truncated}
+
+    def cli_snapshot(self, job_id, *, provider, lease_token):
+        """Get bounded evidence for the worker's disposable, read-only JSON mount."""
+        def check(conn):
+            job = self.jobs.require_lease(job_id, provider, lease_token, db=conn)
+            if (job["project"] != self.project or job["kind"] != "audit" or job["role"] != "audit" or
+                    job["payload"]["kind"] not in {"pr", "ci"}):
+                raise PermissionError("Only the assigned product audit can mount evidence")
+            return job
+
+        # Check before any network access as well as at the fenced snapshot write.
+        check(None)
+        context = self.audit_context(job_id, provider=provider, check=check)
+        return {"job_id": job_id, "sha": context["sha"], "truncated": context["truncated"],
+                "evidence": [{key: entry[key] for key in ("id", "path", "text")}
+                             for entry in context["evidence"] if entry["kind"] == "diff"]}
 
     def submit_result(self, job_id, findings, *, provider, db=None):
         if not isinstance(findings, list) or len(findings) > 15:
@@ -359,7 +411,9 @@ class Patrol:
         return assigned, finding
 
     def _post(self, patrol_id, job, finding_id, mode, *, provider, check, db=None):
-        with self._db(db) as conn:
+        # Serialize marker lookups with the subsequent request in this single Core instance.
+        # Other workers can heartbeat while GitHub returns the read-only pages.
+        with self._outbound_lock, self._db(db) as conn:
             assigned, finding = self._finding(conn, job, finding_id, provider)
             repo, target, sha = assigned["repo"], assigned["target"], assigned["sha"]
             if mode == "comment" and assigned["kind"] != "pr":
@@ -368,10 +422,11 @@ class Patrol:
             old = conn.execute("SELECT receipt FROM patrol_action WHERE project=? AND id=?",
                                (self.project, key)).fetchone()
             if old:
+                self._fence(conn, check)
                 return json.loads(old[0])
             route = f"/repos/{repo}/issues"
             if mode == "comment":
-                route += f"/{target}/comments"
+                route = f"/repos/{repo}/pulls/{target}/reviews"
             marker = f"<!-- sprint-relay-audit:{key} -->"
             matches = [item for item in self.github._pages(route, {"state": "all"} if mode == "issue" else {})
                        if not item.get("pull_request") and (item.get("body") or "").startswith(marker + "\n")]
@@ -379,6 +434,7 @@ class Patrol:
                 raise Conflict("Ambiguous audit action marker")
             label, condition = CATEGORIES[finding["category"]]
             if matches:
+                self._fence(conn, check)
                 item = matches[0]
             else:
                 # Copy no free-form AI text, transcripts, source excerpts or CI logs to GitHub.
@@ -388,10 +444,12 @@ class Patrol:
                         f"Evidence: {finding['evidence_url']}\n\nPotential impact: {label}.\n\n"
                         f"Acceptance: {condition}\n\nPrivate review reference: `{finding_id}`")
                 request = {"body": body}
+                if mode == "comment":
+                    request.update(event="COMMENT", commit_id=sha)
                 if mode == "issue":
                     request["title"] = f"[SprintRelay] {label} in {assigned['kind'].upper()} #{target}"
                 self._finding(conn, job, finding_id, provider)  # Recheck the remote head before posting.
-                check()
+                self._fence(conn, check)
                 item = self.github.request("POST", route, request)
             number = item["number"] if mode == "issue" else item["id"]
             receipt = dict(receipt=key, status="posted", repo=repo, number=number)
@@ -426,8 +484,10 @@ class Patrol:
                     raise Conflict("Stale task version")
                 record["task"] = replace(task, priority=priority).to_dict()
                 record.setdefault("applied", []).append(key)
-                check()
+                self._fence(conn, check)
                 self.github._store(records, sha, "Adjust SprintRelay priority using verified audit evidence")
+            else:
+                self._fence(conn, check)
             return {"receipt": key, "status": "applied", "repo": task.repo, "number": task.issue}
 
     def report(self, patrol_id, summary, references, *, provider, check, db=None):
@@ -440,13 +500,24 @@ class Patrol:
             if not row:
                 raise ValueError("Read the patrol snapshot first")
             audits = json.loads(row["completed_audits"])
+            changes = json.loads(row["changes"])
+            items = {item["id"] for item in changes}
             for ref in references:
-                if not isinstance(ref, str) or ref not in audits:
-                    raise ValueError("Report references must identify audits in the patrol snapshot")
-                self.audit_result(ref, provider=provider, db=conn)
+                if ref in audits:
+                    self.audit_result(ref, provider=provider, db=conn)
+                elif ref not in items:
+                    raise ValueError("Report references must identify items in the patrol snapshot")
             key = "patrol:" + patrol_id
             # Discord task channels can have a wider audience than a meeting.
-            text = f"SprintRelay patrol: {len(json.loads(row['changes']))} changed items; {len(references)} audit results."
+            text = (f"SprintRelay patrol: {len(changes)} changed items, {len(audits)} completed audits, "
+                    f"{len(references)} referenced items.")
             check()
+            data = {"patrol_id": patrol_id, "provider": provider, "summary": summary, "references": references}
+            signature = digest(data)
+            old = conn.execute("SELECT digest FROM artifacts WHERE project=? AND id=?", (self.project, key)).fetchone()
+            if old and old[0] != signature:
+                raise Conflict("An immutable report already exists for this patrol")
+            conn.execute("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?)",
+                         (key, self.project, "patrol_report", signature, json_data(data), self.now().timestamp()))
             conn.execute("INSERT OR IGNORE INTO relay_notice(id,body) VALUES(?,?)", (key, text))
             return {"receipt": key, "status": "queued"}

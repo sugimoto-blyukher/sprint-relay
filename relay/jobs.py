@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -21,6 +22,9 @@ SCHEMA = (
         created REAL NOT NULL, started REAL, finished REAL, error_class TEXT, result_ref TEXT,
         UNIQUE(project,kind,idem))""",
     "CREATE INDEX IF NOT EXISTS job_ready ON jobs(project,state,next_attempt_at,priority)",
+    """CREATE TABLE IF NOT EXISTS audit_log(
+        id INTEGER PRIMARY KEY, created REAL NOT NULL, project TEXT NOT NULL, actor TEXT NOT NULL,
+        provider TEXT, job_id TEXT, operation TEXT NOT NULL, outcome TEXT NOT NULL, target TEXT)""",
     """CREATE TABLE IF NOT EXISTS job_attempts(
         job_id TEXT REFERENCES jobs(id), generation INTEGER, provider TEXT NOT NULL, started REAL NOT NULL,
         finished REAL, outcome TEXT, PRIMARY KEY(job_id,generation))""",
@@ -33,6 +37,10 @@ SCHEMA = (
     """CREATE TABLE IF NOT EXISTS patrol_slots(
         project TEXT PRIMARY KEY, job_id TEXT REFERENCES jobs(id), sequence INTEGER NOT NULL,
         interval_minutes INTEGER NOT NULL, next_at REAL NOT NULL, last_success REAL, checkpoint TEXT)""",
+    """CREATE TABLE IF NOT EXISTS muse_challenge(
+        project TEXT PRIMARY KEY, challenge TEXT NOT NULL, expires REAL NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS muse_proof(
+        receipt TEXT PRIMARY KEY, project TEXT NOT NULL, verified REAL NOT NULL)""",
     "CREATE TABLE IF NOT EXISTS muse_contact(project TEXT PRIMARY KEY,seen REAL NOT NULL)",
     "CREATE TABLE IF NOT EXISTS cli_proof(provider TEXT,role TEXT,verified REAL,PRIMARY KEY(provider,role))",
     "CREATE TABLE IF NOT EXISTS job_control(project TEXT PRIMARY KEY, paused INTEGER NOT NULL)",
@@ -46,6 +54,16 @@ TERMINAL_ERRORS = {"PERMISSION", "INPUT", "SECURITY", "CONTRADICTION"}
 SOFT_ERRORS = {"TIMEOUT", "FORMAT", "TRANSIENT"}
 SHARED_ERRORS = {"AUTH", "QUOTA", "OUTAGE", "UNAVAILABLE"}
 ERRORS = TERMINAL_ERRORS | SOFT_ERRORS | SHARED_ERRORS | {"DEPENDENCY", "CAPABILITY"}
+AUDIT_OPERATIONS = frozenset("""
+    get_project_context list_workflow_jobs claim_job heartbeat_job get_transcript submit_minutes
+    get_specification submit_specification submit_validation submit_task_plan claim_patrol get_patrol_delta
+    get_tasks get_schedule get_progress request_audit get_audit_status get_audit_context submit_audit_result
+    get_audit_result propose_or_create_issue post_review_comment update_task_priority publish_patrol_report
+    complete_patrol report_job_failure unknown_tool pause resume patrol_requested claim finish
+    provider_unavailable provider_recovered
+""".split())
+AUDIT_OUTCOMES = {"allowed", "denied", "invalid", "retry", "conflict", "failed", "stale",
+                  "success", "FAILED", "RETRY_WAIT", "CANCELLED", "COMPLETED"} | ERRORS
 ACTIVE = ("PENDING", "RETRY_WAIT", "RUNNING")
 ROLE_KINDS = {
     "management": {"minutes", "specification", "validation", "task_plan", "patrol", "probe"},
@@ -92,18 +110,39 @@ class JobStore:
             db.close()
 
     @contextmanager
-    def transaction(self, db=None):
+    def transaction(self, db=None, *, write=True):
         if db is not None:
             yield db
             return
         with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             try:
                 yield conn
                 conn.commit()
             except BaseException:
                 conn.rollback()
                 raise
+
+    def audit(self, project, actor, provider, job_id, operation, outcome, target=None, *, db=None):
+        """Write only bounded identifiers, independently of the untrusted action payload."""
+        known_provider = provider if provider in ("muse", "claude_code", "codex", "antigravity", "core") else None
+        known_project = project if project == self.config.management_repo else "other_project"
+        actor = str(actor) if actor is not None else "system"
+        if actor == "system" or (actor.isdecimal() and len(actor) <= 20 and
+                                 (actor in self.config.members or actor in self.config.approvers)):
+            safe_actor = actor
+        else:
+            safe_actor = "principal:" + _hash(actor)[:20]
+        job_id = job_id if isinstance(job_id, str) and re.fullmatch(r"[a-f0-9]{32}", job_id) else None
+        target = target if isinstance(target, str) and re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", target) else None
+        with self.transaction(db) as conn:
+            if job_id and not conn.execute("SELECT 1 FROM jobs WHERE project=? AND id=?", (project, job_id)).fetchone():
+                job_id = None
+            conn.execute("""INSERT INTO audit_log(created,project,actor,provider,job_id,operation,outcome,target)
+                            VALUES (?,?,?,?,?,?,?,?)""",
+                         (self.clock(), known_project, safe_actor, known_provider, job_id,
+                          operation if operation in AUDIT_OPERATIONS else "unknown_tool",
+                          outcome if outcome in AUDIT_OUTCOMES else "failed", target))
 
     def _job(self, row):
         if row is None:
@@ -118,7 +157,7 @@ class JobStore:
         return job
 
     def get(self, job_id, db=None):
-        with self.transaction(db) as conn:
+        with self.transaction(db, write=False) as conn:
             return self._job(conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone())
 
     def enqueue(self, project, kind, role, key, payload, providers, *, db=None, priority=0, target_sha=None):
@@ -143,13 +182,13 @@ class JobStore:
                 (job_id, project, kind, role, key, raw, plist, target_sha, priority, now, now))
             return job_id
 
-    def _configured(self, provider, role):
+    def _configured(self, provider, role, *, probe=False):
         if role == "system":
             return provider == "core"
         settings = self.config.agents.get(provider)
         order = self.config.management_order if role == "management" else self.config.audit_order
-        return bool(provider in order and settings and settings.enabled and settings.verified and
-                    settings.terms_confirmed and (provider != "muse" or settings.schedule_confirmed))
+        return bool(provider in order and settings and settings.enabled and settings.terms_confirmed
+                    and (probe or (settings.verified and (provider != "muse" or settings.schedule_confirmed))))
 
     def _ill(self, db, provider, role):
         return db.execute("SELECT * FROM agent_health WHERE provider=? AND role IN (?, '*')",
@@ -163,7 +202,7 @@ class JobStore:
             return None
         order = self.config.management_order if role == "management" else self.config.audit_order
         for provider in order:
-            if not self._configured(provider, role):
+            if not self._configured(provider, role, probe=job["kind"] == "probe"):
                 continue
             health = self._ill(db, provider, role)
             if job["kind"] == "probe":
@@ -191,7 +230,7 @@ class JobStore:
                 AND (role=? OR provider=?) LIMIT 1""", (job["role"], provider)).fetchone()
 
     def list_jobs(self, project, *, role=None, provider=None, kinds=None, limit=50, cursor=None, db=None, include_busy=False):
-        with self.transaction(db) as db:
+        with self.transaction(db, write=False) as db:
             query = "SELECT * FROM jobs WHERE project=? AND id>?"
             args = [project, cursor or ""]
             if role:
@@ -229,10 +268,11 @@ class JobStore:
             (provider, _hash(token), lease_until, now, job["id"]))
         db.execute("INSERT INTO job_attempts(job_id,generation,provider,started) VALUES(?,?,?,?)",
                    (job["id"], job["fence_generation"] + 1, provider, now))
+        self.audit(job["project"], provider, provider, job["id"], "claim", "success", job["target_sha"], db=db)
         return {**self.get(job["id"], db), "lease_token": token, "deadline": deadline}
 
     def require_lease(self, job_id, provider, token, *, db=None):
-        with self.transaction(db) as conn:
+        with self.transaction(db, write=False) as conn:
             row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if (not row or row["state"] != "RUNNING" or row["provider"] != provider or
                     row["lease_until"] <= self.clock() or not isinstance(token, str) or
@@ -240,7 +280,7 @@ class JobStore:
                     (row["role"] != "system" and self._paused(conn, row["project"]))):
                 raise PermissionError("Invalid or expired job lease")
             if row["role"] != "system":
-                if not self._configured(provider, row["role"]):
+                if not self._configured(provider, row["role"], probe=row["kind"] == "probe"):
                     raise PermissionError("Provider disabled")
                 if row["kind"] != "probe" and provider not in self.config.privacy.project_providers:
                     raise PermissionError("Project consent withdrawn")
@@ -267,7 +307,7 @@ class JobStore:
         db.execute("INSERT INTO job_outbox(project,message) VALUES(?,?)", (project, message))
 
     def notifications(self, project):
-        with self.transaction() as db:
+        with self.transaction(write=False) as db:
             return [(r["id"], r["message"]) for r in db.execute(
                 "SELECT id,message FROM job_outbox WHERE project=? AND sent=0 ORDER BY id LIMIT 100", (project,))]
 
@@ -283,9 +323,12 @@ class JobStore:
                 lease_hash=NULL,lease_until=NULL WHERE id=?""",
                    (state, error, artifact, None if state in ACTIVE else now, now+delay, job["id"]))
 
+        self.audit(job["project"], job["provider"], job["provider"], job["id"], "finish", state, db=db)
+
     def _recover(self, db, project, provider, role):
         if self._ill(db, provider, role):
             db.execute("DELETE FROM agent_health WHERE provider=? AND role IN (?, '*')", (provider, role))
+            self.audit(project, "system", provider, None, "provider_recovered", "success", db=db)
             self._notice(db, project, f"{provider} recovered for {role}; eligible at the next job boundary.")
 
     def complete(self, job_id, provider, token, result, *, on_submit=None):
@@ -319,7 +362,7 @@ class JobStore:
             return artifact
 
     def artifact(self, artifact_id, db=None):
-        with self.transaction(db) as conn:
+        with self.transaction(db, write=False) as conn:
             row = conn.execute("SELECT data FROM artifacts WHERE id=?", (artifact_id,)).fetchone()
             if not row:
                 raise ValueError("Unknown artifact")
@@ -337,6 +380,10 @@ class JobStore:
             raise ValueError("Unknown failure classification")
         provider, role = job["provider"], job["role"]
         if error in TERMINAL_ERRORS or (role == "system" and error != "DEPENDENCY"):
+            if job["kind"] == "probe":
+                # Retire this invalid request. A later commissioning attempt uses
+                # an independent synthetic challenge for this same provider.
+                self._quarantine(db, job["project"], provider, role, "CAPABILITY")
             self._finish(db, job, "FAILED", error)
             self._notice(db, job["project"], f"{job['kind']} job {job['id']} stopped ({error}); review required.")
             return "FAILED"
@@ -374,34 +421,57 @@ class JobStore:
         seconds = min(base * 2 ** min(12, count-1) * jitter, 60*self.config.watchdog.max_backoff_minutes)
         retry_at = self.clock() + max(seconds, retry_after or 0)
         db.execute("INSERT OR REPLACE INTO agent_health VALUES(?,?,?,?,?)", (provider, scope, count, error, retry_at))
+        self.audit(project, "system", provider, None, "provider_unavailable", error, db=db)
         if not previous:
             self._notice(db, project, f"{provider} unavailable ({error})" +
                          (". Sign in again using the official client." if error == "AUTH" else "."))
 
-    def probe_read(self, project, provider, role):
-        # Invoked by the MCP gateway only after authenticated Muse reads synthetic context.
-        if provider != "muse" or role != "management" or not self._configured(provider, role):
+    def probe_read(self, project, provider, role, *, answer=None):
+        """Authenticated Muse commissioning and recovery with no project content."""
+        if provider != "muse" or role != "management" or not self._configured(provider, role, probe=True):
             raise PermissionError("Unsupported remote recovery check")
+        now = self.clock()
         with self.transaction() as db:
-            db.execute("INSERT OR REPLACE INTO muse_contact VALUES(?,?)", (project, self.clock()))
+            if answer is None and self._configured(provider, role) and not self._ill(db, provider, role):
+                return {}
+            row = db.execute("SELECT * FROM muse_challenge WHERE project=?", (project,)).fetchone()
+            if answer is None:
+                if not row or row["expires"] <= now:
+                    challenge = secrets.token_hex(16)
+                    db.execute("INSERT OR REPLACE INTO muse_challenge VALUES(?,?,?)", (project, challenge, now+120))
+                else:
+                    challenge = row["challenge"]
+                return {"challenge": challenge, "instruction": "Call get_project_context with probe_answer equal to challenge reversed."}
+            if not row or row["expires"] <= now or not isinstance(answer, str) or not hmac.compare_digest(
+                answer, row["challenge"][::-1]
+            ):
+                raise ValueError("Invalid or expired remote challenge")
+            db.execute("DELETE FROM muse_challenge WHERE project=?", (project,))
+            receipt = uuid.uuid4().hex
+            db.execute("INSERT INTO muse_proof VALUES(?,?,?)", (receipt, project, now))
+            db.execute("INSERT OR REPLACE INTO muse_contact VALUES(?,?)", (project, now))
             health = self._ill(db, provider, role)
-            if health and all(row["retry_at"] <= self.clock() for row in health):
+            if health and all(h["retry_at"] <= now for h in health):
                 self._recover(db, project, provider, role)
+            return {"receipt": receipt, "verified_at": now}
 
     @staticmethod
     def _paused(db, project):
         row = db.execute("SELECT paused FROM job_control WHERE project=?", (project,)).fetchone()
         return bool(row and row[0])
 
-    def set_paused(self, project, paused):
+    def set_paused(self, project, paused, *, actor=None):
         with self.transaction() as db:
+            self.audit(project, actor, None, None, "pause" if paused else "resume", "success", db=db)
             db.execute("INSERT OR REPLACE INTO job_control VALUES(?,?)", (project, int(paused)))
 
-    def patrol(self, project, *, force=False):
+    def patrol(self, project, *, force=False, actor=None):
         interval = self.config.patrol.interval_minutes
         now = self.clock()
         with self.transaction() as db:
             row = db.execute("SELECT * FROM patrol_slots WHERE project=?", (project,)).fetchone()
+            if force:
+                self.audit(project, actor, None, row["job_id"] if row else None, "patrol_requested", "success", db=db)
             if row:
                 job = self.get(row["job_id"], db)
                 if row["interval_minutes"] != interval:
@@ -422,7 +492,7 @@ class JobStore:
             return job_id
 
     def checkpoint(self, project, *, db=None):
-        with self.transaction(db) as db:
+        with self.transaction(db, write=False) as db:
             row = db.execute("SELECT checkpoint FROM patrol_slots WHERE project=?", (project,)).fetchone()
             return json.loads(row[0]) if row and row[0] else None
 
@@ -453,7 +523,7 @@ class JobStore:
                     break
             for role, order in (("management", self.config.management_order), ("audit", self.config.audit_order)):
                 for provider in order:
-                    if provider == "muse" or not self._configured(provider, role):
+                    if provider == "muse" or not self._configured(provider, role, probe=True):
                         continue
                     if not db.execute("SELECT 1 FROM cli_proof WHERE provider=? AND role=?", (provider, role)).fetchone():
                         db.execute("INSERT OR IGNORE INTO agent_health VALUES(?,?,0,'UNTESTED',0)", (provider, role))
@@ -463,7 +533,7 @@ class JobStore:
                     continue
                 roles = ("management", "audit") if row["role"] == "*" else (row["role"],)
                 for role in roles:
-                    if not self._configured(provider, role):
+                    if not self._configured(provider, role, probe=True):
                         continue
                     # No project data in probes, even when a project has not consented.
                     key = f"probe:{provider}:{role}:{row['retry_at']}"
@@ -488,7 +558,7 @@ class JobStore:
             return claims
 
     def status(self, project):
-        with self.transaction() as db:
+        with self.transaction(write=False) as db:
             routes = {}
             for role in ("management", "audit"):
                 job = {"kind": "patrol" if role == "management" else "audit", "role": role,
@@ -497,7 +567,11 @@ class JobStore:
             slot = db.execute("SELECT sequence,next_at,last_success FROM patrol_slots WHERE project=?", (project,)).fetchone()
             pending = db.execute("SELECT COUNT(*) FROM jobs WHERE project=? AND state IN ('PENDING','RETRY_WAIT')",
                                  (project,)).fetchone()[0]
-            return {"active_providers": routes, "degraded": not all(routes.values()), "paused": self._paused(db, project),
+            muse_proofs = [dict(r) for r in db.execute(
+                "SELECT receipt,verified FROM muse_proof WHERE project=? ORDER BY verified DESC LIMIT 4", (project,))]
+            return {"muse_proofs": muse_proofs,
+                    "cli_proofs": [dict(r) for r in db.execute("SELECT * FROM cli_proof ORDER BY provider,role")],
+                    "active_providers": routes, "degraded": not all(routes.values()), "paused": self._paused(db, project),
                     "pending": pending, "patrol": dict(slot) if slot else None,
                     "health": [dict(row) for row in db.execute("SELECT * FROM agent_health ORDER BY provider,role")]}
 

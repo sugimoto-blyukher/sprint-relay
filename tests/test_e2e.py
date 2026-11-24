@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, Mock
 import discord
 from relay.jobs import JobStore
 from relay.gateway import Gateway
+from relay.mcp_contracts import T
 from relay.security import Principal
 import pytest
 
@@ -39,14 +40,14 @@ def test_transcript_to_cross_channel_delivery(tmp_path, monkeypatch, inline_work
     config = Config.load(Path(__file__).resolve().parents[1] / "config.example.toml")
     config.management_repo = "owner/manage"
     config.project_id = "project-fixture"
-    # Synthetic, previously verified MCP account. No provider contacts occur.
+    # Synthetic MCP account. No provider contacts occur.
     monkeypatch.setenv("OPENAI_API_KEY", "unused-fixture")
     monkeypatch.setenv("MODEL_API_KEY", "unused-fixture")
     def no_network(*args, **kwargs):
         pytest.fail("This acceptance flow must run entirely without external network access")
     monkeypatch.setattr(socket, "create_connection", no_network)
     config.agents["muse"] = config.agents["muse"].model_copy(update={
-        "enabled": True, "verified": True, "terms_confirmed": True, "schedule_confirmed": True,
+        "enabled": True, "verified": False, "terms_confirmed": True, "schedule_confirmed": False,
     })
     config.privacy = config.privacy.model_copy(update={"project_providers": ("muse",)})
     api = FakeAPI()
@@ -75,7 +76,13 @@ def test_transcript_to_cross_channel_delivery(tmp_path, monkeypatch, inline_work
     principal = Principal("synthetic-muse", "muse", "management", config.management_repo)
 
     def tool(name, **inputs):
-        return gateway.dispatch(name, principal, {"project_id": config.management_repo, **inputs})
+        result = gateway.dispatch(name, principal, {"project_id": config.management_repo, **inputs})
+        return T[name][1].model_validate(result).model_dump(mode="json", exclude_unset=True)
+
+    def prove_muse():
+        challenge = tool("get_project_context")["probe"]["challenge"]
+        answer = tool("get_project_context", probe_answer=challenge[::-1])
+        assert answer["probe"]["receipt"]
 
     def claim(kind):
         listed = tool("list_workflow_jobs", kinds=[kind])["jobs"]
@@ -98,6 +105,14 @@ def test_transcript_to_cross_channel_delivery(tmp_path, monkeypatch, inline_work
         return response.args[0] if response.args else response.kwargs["file"]
 
     designer, approver = "10102", "10101"
+    # The operator first observes two authenticated synthetic receipts one patrol apart.
+    prove_muse()
+    clock[0] += config.patrol.interval_minutes * 60
+    prove_muse()
+    assert len(jobs.status(config.management_repo)["muse_proofs"]) == 2
+    config.agents["muse"] = config.agents["muse"].model_copy(update={
+        "verified": True, "schedule_confirmed": True,
+    })
     # A01/A02. A posted message and ordinary poll cannot enqueue a meeting.
     service.poll()
     assert not tool("list_workflow_jobs")["jobs"]
@@ -193,9 +208,10 @@ def test_transcript_to_cross_channel_delivery(tmp_path, monkeypatch, inline_work
             github.ack(event_id)
     service.poll()
     assert not github.notifications()
-    # An authenticated read after the cooldown restores Muse at a safe job boundary.
+    # A two-step authenticated synthetic probe restores Muse at a safe job boundary.
     clock[0] += 8 * 3600
-    tool("get_project_context")
+    challenge = tool("get_project_context")["probe"]["challenge"]
+    tool("get_project_context", probe_answer=challenge[::-1])
     resumed = claim("minutes")
     assert resumed["job_id"] == delayed_job["job_id"]
     tool("submit_minutes", **resumed, minutes=minutes)

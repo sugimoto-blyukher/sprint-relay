@@ -141,7 +141,8 @@ def test_a10_muse_absent_failover_late_return_and_grace(queue):
     complete(queue, fallback, {"cursor": "safe-boundary"})
     wait = next(h["retry_at"] for h in queue.status(PROJECT)["health"] if h["provider"] == "muse")
     queue.clock.advance(wait - queue.clock())
-    queue.probe_read(PROJECT, "muse", "management")
+    challenge = queue.probe_read(PROJECT, "muse", "management")["challenge"]
+    queue.probe_read(PROJECT, "muse", "management", answer=challenge[::-1])
     queue.maintenance(PROJECT)
     next_slot = queue.patrol(PROJECT)
     assert next_slot != slot
@@ -254,3 +255,43 @@ def test_failed_probe_keeps_fallback_available(queue):
     failure(queue, queue.claim(probe["id"], "codex"), "AUTH")
     assert queue.get(probe["id"])["state"] == "FAILED"
     assert queue.claim(job, "antigravity")["provider"] == "antigravity"
+
+
+def test_audit_log_omits_untrusted_payloads_and_preserves_decision(queue):
+    job = enqueue(queue, "private-transcript-text")
+    claim = queue.claim(job, "muse")
+    queue.audit(PROJECT, "unsafe-identity", "muse", job, "get_transcript", "allowed")
+    queue.audit("private-project-injected", "unsafe-identity", "private-provider", "malformed-token",
+                "private-unknown-tool", "private-error-message", target="private-source-text")
+    queue.set_paused(PROJECT, True, actor="10101")
+    with queue.transaction(write=False) as db:
+        rows = [dict(r) for r in db.execute("SELECT * FROM audit_log")]
+    records = str(rows)
+    assert all(s not in records for s in ("private-", "unsafe-identity", "malformed-token", claim["lease_token"]))
+    assert rows[1]["outcome"] == "allowed" and rows[1]["job_id"] == job
+    assert rows[2]["operation"] == "unknown_tool" and rows[2]["outcome"] == "failed"
+    assert rows[-1]["actor"] == "10101" and rows[-1]["operation"] == "pause"
+
+
+def test_commission_cli_and_remote_schedule_without_releasing_project_data(queue):
+    for provider in POLICY:
+        queue.config.agents[provider] = queue.config.agents[provider].model_copy(
+            update={"verified": False, "schedule_confirmed": False})
+    real = enqueue(queue, "consented-meeting")
+    verify_cli(queue)
+    assert {p["provider"] for p in queue.status(PROJECT)["cli_proofs"]} == set(POLICY) - {"muse"}
+    for _ in range(2):
+        probe = queue.probe_read(PROJECT, "muse", "management")
+        challenge = probe["challenge"]
+        with pytest.raises(ValueError):
+            queue.probe_read(PROJECT, "muse", "management", answer="invalid")
+        receipt = queue.probe_read(PROJECT, "muse", "management", answer=challenge[::-1])
+        assert receipt["verified_at"] == queue.clock()
+        with pytest.raises(ValueError):
+            queue.probe_read(PROJECT, "muse", "management", answer=challenge[::-1])
+        queue.clock.advance(45 * 60)
+    times = [p["verified"] for p in queue.status(PROJECT)["muse_proofs"]]
+    assert times[0] - times[1] == 45 * 60
+    for provider in POLICY:
+        with pytest.raises(PermissionError):
+            queue.claim(real, provider)

@@ -40,7 +40,10 @@ class API(FakeAPI):
             self.files_read.append(route)
             return {"files": [{"filename": "src/widget.py", "patch": f"@@ -1,1 +1,2 @@\n+{INJECT}\n+token=fixture"},
                               {"filename": ".env", "patch": "do not share"}]}
-        if route == "/repos/owner/product/issues/8/comments" and method == "POST":
+        if route == "/repos/owner/product/pulls/8/reviews":
+            if method == "GET":
+                return self.comments.get(8, [])
+            assert data["commit_id"] == HEAD and data["event"] == "COMMENT"
             self.comments.setdefault(8, []).append({"body": data["body"], "id": 77})
             if self.lose_comment:
                 self.lose_comment = False
@@ -139,7 +142,7 @@ def test_a08_enqueues_once_per_sha_and_ci_attempt_with_bounded_anchors(rig):
 def test_a11_lost_response_recovers_single_issue_and_pr_comment(rig):
     p, api = rig
     job, finding = result(p)
-    auth = {"provider": "muse", "check": lambda: None}
+    auth = {"provider": "muse", "check": lambda conn: None}
     api.lose_response = True
     with pytest.raises(TimeoutError):
         p.repair("slot", job, finding, **auth)
@@ -159,14 +162,14 @@ def test_a12_a14_stale_head_lease_or_unsupported_finding_cannot_write(rig):
     p, api = rig
     job, finding = result(p)
 
-    def lost_lease():
+    def lost_lease(conn):
         raise PermissionError("Lease lost")
 
     with pytest.raises(PermissionError):
         p.repair("slot", job, finding, provider="muse", check=lost_lease)
     api.pr["head"] = {"sha": "c" * 40}
     with pytest.raises(Conflict, match="Stale"):
-        p.comment("slot", job, finding, provider="muse", check=lambda: None)
+        p.comment("slot", job, finding, provider="muse", check=lambda conn: None)
     assert not api.comments and not api.issues
     with pytest.raises(PermissionError):
         p.audit_result(job, provider="unapproved")
@@ -176,7 +179,7 @@ def test_priority_has_task_version_and_linked_artifact_gates(rig):
     p, api = rig
     job, finding = result(p)
     old = p.github.publish([task()])[0]
-    auth = {"provider": "muse", "check": lambda: None}
+    auth = {"provider": "muse", "check": lambda conn: None}
     with pytest.raises(PermissionError, match="linked"):
         p.priority("slot", job, finding, "T1", digest(old.to_dict()), 3, **auth)
     linked = p.github.action("T1", "link", "1", "https://github.com/owner/product/pull/8")
@@ -207,6 +210,20 @@ def test_real_slots_fence_audit_and_resume_checkpoint(rig):
         batch = p.delta(slot, provider="muse", db=db)
         audit = p.request_audit(slot, "pr", "owner/product", "8", HEAD, "Check test coverage",
                                 db=db, provider="muse")
+    from relay.patrol import latest_report
+    with store.transaction() as db:
+        def check():
+            store.require_lease(slot, "muse", lease, db=db)
+
+        ref = batch["changes"][0]["id"]
+        p.report(slot, INJECT, [ref], provider="muse", check=check, db=db)
+        p.report(slot, INJECT, [ref], provider="muse", check=check, db=db)
+        stamp = p.now().timestamp()
+        report = latest_report(db, p.project, 30, now=stamp)
+        assert report["summary"] == INJECT and report["references"] == [ref]
+        assert latest_report(db, "other/project", 30, now=stamp) is None
+        assert latest_report(db, p.project, 30, now=stamp + 31 * 86400) is None
+    assert INJECT not in str(p.github.notifications())
     assert store.get(audit["job_id"])["state"] == "PENDING"
     store.complete(slot, "muse", lease, {"cursor": batch["snapshot_cursor"]},
                    on_submit=lambda db, job, provider, data: p.complete(slot, data["cursor"], db=db))
@@ -216,3 +233,53 @@ def test_real_slots_fence_audit_and_resume_checkpoint(rig):
         store.require_lease(slot, "muse", lease)
     now[0] += 45 * 60
     assert store.patrol(p.project) != slot
+
+
+def test_expired_lease_during_remote_read_rolls_back_snapshot(rig):
+    p, api = rig
+
+    def stale(conn):
+        raise PermissionError("expired during GitHub request")
+
+    with pytest.raises(PermissionError):
+        p.delta("expired", provider="muse", check=stale)
+    with p._db() as db:
+        assert db.execute("SELECT COUNT(*) FROM patrol_scan WHERE id='expired'").fetchone()[0] == 0
+
+
+def test_ci_logs_and_manager_free_text_cannot_enter_public_output(rig):
+    p, api = rig
+    api.private = False
+    api.run["name"] = api.run["logs"] = INJECT
+    job = start(p, "ci")
+    ctx = p.audit_context(job, provider="codex")
+    run_anchor = next(item for item in ctx["evidence"] if item["kind"] == "run")
+    assert INJECT not in run_anchor["text"] and INJECT not in ctx["question"]
+    finding = {"category": "ci_failure", "severity": "high", "evidence_id": run_anchor["id"],
+               "summary": INJECT, "impact": INJECT, "acceptance": INJECT}
+    saved = p.submit_result(job, [finding], provider="codex")
+    p.repair("slot", job, saved["findings"][0]["finding_id"], provider="muse", check=lambda conn: None)
+    assert INJECT not in str(api.issues)
+    assert "actions/runs/88/attempts/1" in api.issues[1]["body"]
+    api.run["run_attempt"] += 1
+    with pytest.raises(Conflict):
+        p.repair("slot", job, saved["findings"][0]["finding_id"], provider="muse", check=lambda conn: None)
+
+
+def test_cli_snapshot_is_scoped_to_the_leased_product_audit(rig, monkeypatch):
+    p, api = rig
+    job = start(p)
+    fences = []
+    def authorization(job_id, provider, token, *, db):
+        if job_id != job or token != "scoped" or provider != "codex":
+            raise PermissionError("Wrong lease")
+        fences.append(db is not None)
+        return {"project": p.project, **p.jobs.jobs[job]}
+    monkeypatch.setattr(p.jobs, "require_lease", authorization, raising=False)
+    with pytest.raises(PermissionError):
+        p.cli_snapshot(job, provider="codex", lease_token="wrong")
+    assert not api.files_read
+    mounted = p.cli_snapshot(job, provider="codex", lease_token="scoped")
+    assert fences == [False, True]
+    assert mounted["sha"] == HEAD and set(mounted["evidence"][0]) == {"id", "path", "text"}
+    assert not any(raw in str(mounted) for raw in ("token=fixture", "do not share"))

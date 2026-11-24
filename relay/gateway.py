@@ -67,6 +67,26 @@ class Gateway:
             pass
 
     def dispatch(self, name, p, args):
+        outcome = "failed"
+        job_id = p.job_id
+        target = None
+        try:
+            result = self._dispatch(name, p, args)
+            validated = T[name][1].model_validate(result).model_dump(mode="json", exclude_unset=True)
+            job_id = job_id or args.get("job_id") or result.get("job_id")
+            target = result.get("sha") or result.get("digest")
+            outcome = "allowed"
+            return validated
+        except BoundaryError as exc:
+            outcome = {"UNAUTHORIZED": "denied", "LEASE_LOST": "stale", "STALE_REVISION": "stale",
+                       "CONFLICT": "conflict", "INVALID_INPUT": "invalid", "RETRYABLE": "retry",
+                       "BLOCKING_FINDINGS": "conflict"}.get(exc.code, "failed")
+            raise
+        finally:
+            self.jobs.audit(self.project, p.subject, p.provider, job_id, name if name in T else "unknown_tool",
+                            outcome, target=target)
+
+    def _dispatch(self, name, p, args):
         try:
             if p.project != self.project or name not in ALLOWED.get(p.role, ()):
                 raise BoundaryError("UNAUTHORIZED")
@@ -75,14 +95,20 @@ class Gateway:
                 raise BoundaryError("UNAUTHORIZED")
             bound = None
             if p.job_id:
-                self._job(p, p.job_id)
+                assigned = self._job(p, p.job_id)
+                if assigned["kind"] != "probe" and p.provider not in self.config.privacy.project_providers:
+                    raise BoundaryError("UNAUTHORIZED")
                 bound = self._lease(p, p.job_id, p.lease_token)
                 if a.get("job_id", p.job_id) != p.job_id:
                     raise BoundaryError("UNAUTHORIZED")
             elif p.provider != "muse" or p.role != "management":
                 raise BoundaryError("UNAUTHORIZED")
             configured = self.config.agents[p.provider]
-            if not (configured.enabled and configured.terms_confirmed and configured.verified):
+            synthetic = (bound is not None and bound["kind"] == "probe") or (
+                not bound and name == "get_project_context" and p.provider == "muse")
+            if not configured.enabled or not configured.terms_confirmed:
+                raise BoundaryError("UNAUTHORIZED")
+            if not synthetic and (not configured.verified or (p.provider == "muse" and not configured.schedule_confirmed)):
                 raise BoundaryError("UNAUTHORIZED")
             if bound and bound["kind"] == "probe":
                 if name not in {"get_project_context", "heartbeat_job", "report_job_failure"}:
@@ -137,7 +163,9 @@ class Gateway:
                     result["probe"] = {"challenge": bound["payload"]["challenge"],
                                        "instruction": "Use heartbeat_job with probe_answer equal to challenge reversed."}
             elif p.provider == "muse":
-                self.jobs.probe_read(self.project, p.provider, p.role)
+                proof = self.jobs.probe_read(self.project, p.provider, p.role, answer=a.get("probe_answer"))
+                if proof:
+                    result["probe"] = proof
             return result
         if name == "list_workflow_jobs":
             rows = ([bound] if bound else self.jobs.list_jobs(self.project, role=p.role, provider=p.provider,
@@ -201,48 +229,50 @@ class Gateway:
         payload = {k: v for k, v in a.items() if k not in {"project_id", "job_id", "lease_token"}}
         if name.startswith("submit_") or name == "complete_patrol":
             receipt = {}
+            prepared = self.workflow.prepare_job(job, p.provider, payload) if name == "submit_task_plan" else None
+
             def submit(db, active, provider, data):
                 if name == "submit_audit_result":
                     result = self.patrol.submit_result(id, data["findings"], provider=provider, db=db)
                 elif name == "complete_patrol":
                     result = self.patrol.complete(id, data["cursor"], db=db)
                 else:
-                    result = self.workflow.submit_job(db, active, provider, data)
+                    result = self.workflow.submit_job(db, active, provider, data, prepared=prepared)
                 receipt.update(result)
                 return result
             if name == "complete_patrol":
                 payload = {"cursor": a["snapshot_cursor"]}
             self.jobs.complete(id, p.provider, token, payload, on_submit=submit)
             return receipt
-        with self.jobs.transaction() as db:
-            def check():
-                self._lease(p, id, token, db=db)
-            check()
-            if name == "get_audit_context":
-                result = self.patrol.audit_context(id, provider=p.provider, db=db)
-                check()
-                return result
-            if name == "request_audit":
-                if job["kind"] == "validation":
-                    work = job["payload"]
-                    if a["kind"] != "spec" or a["target"] != work["meeting"] or a["sha"] != work["digest"]:
-                        raise BoundaryError("UNAUTHORIZED")
-                return self.patrol.request_audit(id, **payload, provider=p.provider, db=db)
-            if name == "get_patrol_delta":
-                result = self.patrol.delta(id, a["cursor"], a["limit"], provider=p.provider, db=db)
-                result.setdefault("pending_jobs", [])
-                return result
-            options = {"provider": p.provider, "check": check, "db": db}
-            if name == "publish_patrol_report":
-                return self.patrol.report(id, a["summary"], a["references"], **options)
-            args = (id, a["audit_id"], a["finding_id"])
-            if name == "update_task_priority":
-                result = self.patrol.priority(*args, a["task_id"], a["expected_version"], a["priority"], a["reason"], **options)
-                return {"receipt": result["receipt"], "status": result["status"]}
-            if name == "propose_or_create_issue":
-                return self.patrol.repair(*args, **options)
-            if name == "post_review_comment":
-                return self.patrol.comment(*args, **options)
+        # Fetch remote pages and immutable snapshots without blocking job heartbeats.
+        # Patrol acquires a short write transaction and rechecks this lease at commit.
+        def fence(conn):
+            self._lease(p, id, token, db=conn)
+
+        if name == "get_audit_context":
+            return self.patrol.audit_context(id, provider=p.provider, check=fence)
+        if name == "request_audit":
+            if job["kind"] == "validation":
+                work = job["payload"]
+                if a["kind"] != "spec" or a["target"] != work["meeting"] or a["sha"] != work["digest"]:
+                    raise BoundaryError("UNAUTHORIZED")
+            return self.patrol.request_audit(id, **payload, provider=p.provider, check=fence)
+        if name == "get_patrol_delta":
+            return self.patrol.delta(id, a["cursor"], a["limit"], provider=p.provider, check=fence)
+        if name == "publish_patrol_report":
+            with self.jobs.transaction() as db:
+                fence(db)
+                return self.patrol.report(id, a["summary"], a["references"], provider=p.provider,
+                                          check=lambda: fence(db), db=db)
+        options = {"provider": p.provider, "check": fence}
+        args = (id, a["audit_id"], a["finding_id"])
+        if name == "update_task_priority":
+            result = self.patrol.priority(*args, a["task_id"], a["expected_version"], a["priority"], a["reason"], **options)
+            return {"receipt": result["receipt"], "status": result["status"]}
+        if name == "propose_or_create_issue":
+            return self.patrol.repair(*args, **options)
+        if name == "post_review_comment":
+            return self.patrol.comment(*args, **options)
         raise BoundaryError("UNAUTHORIZED")
 
     def _project_read(self, name, a, bound):

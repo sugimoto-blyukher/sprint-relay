@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from pathlib import Path
@@ -100,6 +101,14 @@ STATES_FOR_JOB = {"minutes": "IMPORTED", "specification": "MINUTES_READY",
                   "validation": "VALIDATING", "task_plan": "PLANNING"}
 
 
+@dataclass(frozen=True)
+class PreparedPlan:
+    meeting: str
+    digest: str
+    input_hash: str
+    tasks: tuple[Task, ...]
+
+
 def migrate_workflow(db, project=None):
     """Additive schema. Called inside the migration transaction."""
     db.execute("""CREATE TABLE IF NOT EXISTS meeting (
@@ -117,6 +126,11 @@ def migrate_workflow(db, project=None):
     db.execute("""CREATE TABLE IF NOT EXISTS workflow_approval (
         digest TEXT PRIMARY KEY, project TEXT NOT NULL, meeting TEXT NOT NULL,
         report_hash TEXT NOT NULL, actor TEXT NOT NULL, approved_at TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS workflow_consent (
+        meeting TEXT NOT NULL, project TEXT NOT NULL, actor TEXT NOT NULL,
+        recorded_at TEXT NOT NULL, providers TEXT NOT NULL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS workflow_key (
+        project TEXT NOT NULL, key TEXT NOT NULL, meeting TEXT NOT NULL, PRIMARY KEY(project,key))""")
     db.execute("""CREATE TABLE IF NOT EXISTS workflow_notice (
         id TEXT PRIMARY KEY, project TEXT NOT NULL, body TEXT NOT NULL)""")
 
@@ -205,6 +219,10 @@ class Workflow:
             self.jobs.cancel(row["job_id"], "Human workflow decision", db=db)
         db.execute("UPDATE workflow_v2 SET generation=generation+1,job_id=NULL WHERE meeting=?", (row["id"],))
 
+    def _record_consent(self, db, key, actor, allowed):
+        db.execute("INSERT INTO workflow_consent VALUES(?,?,?,?,?)",
+                   (key, self.project, str(actor), _now(), _json(allowed)))
+
     def _allowed(self, row):
         policy = getattr(getattr(self.config, "privacy", None), "project_providers", ())
         return sorted(set(json.loads(row["providers"])).intersection(policy))
@@ -253,6 +271,7 @@ class Workflow:
                     db.execute("UPDATE meeting SET transcript=?,consent=? WHERE id=?", (text, consent, key))
                     db.execute("UPDATE workflow_v2 SET providers=?, imported_at=? WHERE meeting=?",
                                (_json(allowed), _now(), key))
+                    self._record_consent(db, key, actor, allowed)
                     legacy = self._meeting(db, key)
                     for kind, state in STATES_FOR_JOB.items():
                         if legacy["state"] == state or (kind == "validation" and legacy["state"] == "HUMAN_REVIEWED"):
@@ -265,6 +284,7 @@ class Workflow:
             db.execute("""INSERT INTO workflow_v2(meeting,project,state,providers,attachment_hash,input_hash,imported_at)
                           VALUES(?,?,'IMPORTED',?,?,?,?)""",
                        (key, self.project, _json(allowed), attachment_hash, _digest(text), _now()))
+            self._record_consent(db, key, actor, allowed)
             self._queue(db, self._meeting(db, key), "minutes")
         return key
 
@@ -282,6 +302,7 @@ class Workflow:
             row = self._meeting(db, meeting)
             if json.loads(row["providers"]) == allowed and row["job_id"]:
                 return row["job_id"]
+            self._record_consent(db, meeting, actor, allowed)
             self._supersede(db, row)
             db.execute("UPDATE workflow_v2 SET providers=? WHERE meeting=?", (_json(allowed), meeting))
             db.execute("UPDATE meeting SET consent=? WHERE id=?", (bool(allowed), meeting))
@@ -305,10 +326,14 @@ class Workflow:
         return digest
 
     @staticmethod
-    def _minutes_input(data):
+    def _minutes_input(data, row):
         # Trusted human imports retain compatibility with the v1 minutes JSON.
         if isinstance(data, dict) and "summary" in data:
-            return Minutes.model_validate(data).model_dump()
+            # /spec show includes server-generated source references; preserve
+            # them when humans download, edit, and re-upload the minutes.
+            source = {"meeting_id": row["id"], "source": row["source"]}
+            fields = {k: v for k, v in data.items() if k not in source}
+            return {**Minutes.model_validate(fields).model_dump(), **source}
         return _minutes(data)
 
     def draft(self, meeting, actor, *, markdown=None, minutes=None):
@@ -323,7 +348,7 @@ class Workflow:
                     return row["job_id"]
                 raise PermissionError("Supply Markdown and minutes for manual drafting")
             self._supersede(db, row)
-            records = self._minutes_input(minutes)
+            records = self._minutes_input(minutes, row)
             digest = self._save(db, row, markdown, records, actor, "Initial draft")
             self._state(db, meeting, "DRAFT_READY")
             return digest
@@ -339,7 +364,7 @@ class Workflow:
             if previous["plan"] and row["published"] != row["head"]:
                 raise ValueError("Retry publication of the approved plan first")
             self._supersede(db, row)
-            records = json.loads(previous["minutes"]) if minutes is None else self._minutes_input(minutes)
+            records = json.loads(previous["minutes"]) if minutes is None else self._minutes_input(minutes, row)
             digest = self._save(db, row, markdown, records, actor, reason)
             db.execute("UPDATE workflow_v2 SET audit_job=NULL,audit_result=NULL WHERE meeting=?", (meeting,))
             self._state(db, meeting, "HUMAN_REVIEWED")
@@ -351,7 +376,7 @@ class Workflow:
         with private_db(self.path) as db:
             row = self._meeting(db, meeting)
             output = {"meeting": meeting, "source": row["source"], "state": row["state"],
-                      "job_id": row["job_id"], "digest": None, "minutes": None}
+                      "job_id": row["job_id"], "providers": self._allowed(row), "digest": None, "minutes": None}
             if not digest and not row["head"]:
                 output["minutes"] = json.loads(row["extraction"]) if row["extraction"] else None
                 return output
@@ -415,7 +440,7 @@ class Workflow:
             raise ValueError("Task requirement links must cover exactly the specification IDs")
         return tasks
 
-    def _stage_plan(self, db, row, rev, tasks, *, agent):
+    def _prepare_plan(self, db, row, rev, tasks, *, agent):
         if row["state"] not in ("VALIDATED", "PLANNING", "APPROVED"):
             raise ValueError("Task plan requires the current validated revision")
         data = tasks
@@ -430,6 +455,31 @@ class Workflow:
             old = self._revision(db, row["published"])
             self.changes.preview(row["id"], rev["digest"],
                                  [Task.from_dict(t) for t in json.loads(old["plan"])], plan)
+        return PreparedPlan(row["id"], rev["digest"], _digest(tasks), tuple(plan))
+
+    def prepare_job(self, job, provider, data):
+        """Read the GitHub graph/visibility before the lease completion write transaction."""
+        with private_db(self.path) as db:
+            row = self._job(db, job, provider)
+            rev = self._head(db, row, data["digest"])
+            if job["kind"] != "task_plan" or not rev["approved_by"]:
+                raise PermissionError("Planning requires an approved revision")
+            return self._prepare_plan(db, row, rev, data["tasks"], agent=True)
+
+    def _stage_plan(self, db, row, rev, tasks, prepared, *, agent):
+        if (row["state"] not in ("VALIDATED", "PLANNING", "APPROVED") or not prepared or
+                (row["id"], rev["digest"], _digest(tasks)) !=
+                (prepared.meeting, prepared.digest, prepared.input_hash)):
+            raise ValueError("Preflight must match the current revision and task plan")
+        plan = prepared.tasks
+        # Reserve keys before remote publication, including against other meetings
+        # that finished preflight concurrently while the first publish is pending.
+        for task in plan:
+            db.execute("INSERT OR IGNORE INTO workflow_key VALUES(?,?,?)", (self.project, task.key, row["id"]))
+            owner = db.execute("SELECT meeting FROM workflow_key WHERE project=? AND key=?",
+                               (self.project, task.key)).fetchone()[0]
+            if owner != row["id"]:
+                raise ValueError(f"{task.key}: key reserved by another approved meeting")
         db.execute("UPDATE revision SET plan=? WHERE digest=?",
                    (_json([t.to_dict() for t in plan]), rev["digest"]))
         db.execute("UPDATE workflow_v2 SET agent_plan=? WHERE meeting=?", (bool(agent), row["id"]))
@@ -439,6 +489,13 @@ class Workflow:
         self._approver(actor)
         with self.lock:
             with private_db(self.path) as db:
+                row = self._meeting(db, meeting)
+                rev = self._head(db, row, digest)
+                if row["published"] == digest:
+                    return self._published(rev)
+                prepared = None
+                if tasks is not None and not rev["plan"]:
+                    prepared = self._prepare_plan(db, row, rev, tasks, agent=False)
                 db.execute("BEGIN IMMEDIATE")
                 row = self._meeting(db, meeting)
                 rev = self._head(db, row, digest)
@@ -446,11 +503,9 @@ class Workflow:
                     raise ValueError("Approval requires validation of the current revision")
                 if not rev["report"] or json.loads(rev["report"])["blocking_questions"]:
                     raise ValueError("Resolve blocking questions and validate before approval")
-                if row["published"] == digest:
-                    return self._published(rev)
                 if tasks is not None and not rev["plan"]:
                     self._supersede(db, row)
-                    self._stage_plan(db, row, rev, tasks, agent=False)
+                    self._stage_plan(db, row, rev, tasks, prepared, agent=False)
                 if not rev["approved_by"]:
                     db.execute("UPDATE revision SET approved_by=? WHERE digest=?", (str(actor), digest))
                     db.execute("""INSERT INTO workflow_approval VALUES(?,?,?,?,?,?)""",
@@ -493,6 +548,21 @@ class Workflow:
             self._state(db, meeting, "PUBLISHED")
         return published
 
+    def pending_for(self, provider):
+        """Bounded patrol metadata restricted to this provider's consented meetings."""
+        with private_db(self.path) as db:
+            rows = db.execute("""SELECT v.meeting,m.head AS digest,v.state,v.job_id,v.providers
+                FROM workflow_v2 v JOIN meeting m ON m.id=v.meeting WHERE v.project=?
+                AND v.state IN ('IMPORTED','MINUTES_READY','VALIDATING','WAITING_AUDIT','PLANNING','PUBLISHING')
+                ORDER BY v.imported_at,v.meeting""", (self.project,))
+            result = []
+            for row in rows:
+                if provider in self._allowed(row):
+                    result.append({k: row[k] for k in ("meeting", "digest", "state", "job_id")})
+                    if len(result) == 100:
+                        break
+            return result
+
     def providers_for(self, meeting, digest):
         with private_db(self.path) as db:
             row = self._meeting(db, meeting)
@@ -534,7 +604,7 @@ class Workflow:
                 result["audit_result"] = json.loads(row["audit_result"])
             return result
 
-    def submit_job(self, db, job, provider, data):
+    def submit_job(self, db, job, provider, data, *, prepared=None):
         """Called inside JobStore.complete after lease/scope checks, before commit."""
         row = self._job(db, job, provider)
         kind, meeting = job["kind"], row["id"]
@@ -557,7 +627,7 @@ class Workflow:
             if kind == "task_plan":
                 if not rev["approved_by"]:
                     raise PermissionError("Only a human-approved specification may generate tasks")
-                self._stage_plan(db, row, rev, data["tasks"], agent=True)
+                self._stage_plan(db, row, rev, data["tasks"], prepared, agent=True)
             else:
                 self._agent_review(db, row, rev, data, provider)
         updated = self._meeting(db, meeting)

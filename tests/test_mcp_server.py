@@ -20,6 +20,13 @@ from relay.security import OAuthVerifier, Principal, TokenVault
 from relay.settings import AgentSettings, PrivacySettings
 
 
+@pytest.fixture(autouse=True)
+def no_external_threads(monkeypatch, inline_worker):
+    # Exercise the actual SDK transport using ASGI in-process. Worker threads
+    # require socketpairs for event-loop wakeup in restricted CI environments.
+    monkeypatch.setattr(asyncio, "to_thread", inline_worker)
+
+
 @pytest.fixture
 def system(tmp_path):
     config = Config.load("config.example.toml")
@@ -35,6 +42,8 @@ def system(tmp_path):
 
 def local(system, kind="audit", payload=None):
     role = "audit" if kind == "audit" else "management"
+    settings = system.config.agents["codex"]
+    system.config.agents["codex"] = settings.model_copy(update={"verified": False})
     system.jobs.maintenance(system.project)
     probe = system.jobs.list_jobs(system.project, role=role, provider="codex", kinds=["probe"])[0]
     proof_lease = system.jobs.claim(probe["id"], "codex")["lease_token"]
@@ -42,6 +51,7 @@ def local(system, kind="audit", payload=None):
     challenge = system.dispatch("get_project_context", prover, {"project_id": system.project})["probe"]["challenge"]
     assert system.dispatch("heartbeat_job", prover, {"project_id": system.project, "job_id": probe["id"],
                            "lease_token": proof_lease, "probe_answer": challenge[::-1]})["completed"]
+    system.config.agents["codex"] = settings
     job = system.jobs.enqueue(system.project, kind, role, "key", payload or {"kind": "pr"}, ["codex"])
     lease = system.jobs.claim(job, "codex")["lease_token"]
     clock = [100.]
@@ -92,6 +102,11 @@ def test_untrusted_meeting_text_cannot_authorize_or_change_identity(system):
             result = await client.call_tool("approve_spec", args | {"role": "human"})
             assert result.isError and result.structuredContent["code"] == "UNAUTHORIZED"
             assert "SYNTHETIC_FIXTURE" not in result.content[0].text
+            with system.jobs.transaction(write=False) as db:
+                rows = [dict(row) for row in db.execute("SELECT * FROM audit_log WHERE job_id=?", (job,))]
+            assert any(row["operation"] == "unknown_tool" and row["outcome"] == "denied" for row in rows)
+            assert any(row["operation"] == "get_transcript" and row["outcome"] == "allowed" for row in rows)
+            assert all(word not in str(rows) for word in (lease, token, "approve_spec", "SYNTHETIC_FIXTURE"))
     asyncio.run(run())
 
 

@@ -124,9 +124,13 @@ class GitHub:
         elif repo in self.config.product_repos:
             reads = (
                 r"", r"/issues(?:/[1-9][0-9]*(?:/comments)?)?", r"/pulls(?:/[1-9][0-9]*)?",
-                r"/actions/runs(?:/[1-9][0-9]*)?", r"/commits/[0-9a-f]{40}",
+                r"/pulls/[1-9][0-9]*/reviews", r"/actions/runs(?:/[1-9][0-9]*)?", r"/commits/[0-9a-f]{40}",
                 r"/compare/[0-9a-f]{40}\.\.\.[0-9a-f]{40}",
             )
+            if (method == "POST" and re.fullmatch(r"/pulls/[1-9][0-9]*/reviews", suffix) and
+                    isinstance(data, dict) and set(data) == {"event", "body", "commit_id"} and
+                    data["event"] == "COMMENT" and re.fullmatch(r"[0-9a-f]{40}", data["commit_id"])):
+                return self._product(method, path, data)
             if ((method == "GET" and any(re.fullmatch(rule, suffix) for rule in reads)) or
                     (method == "POST" and re.fullmatch(r"/issues(?:/[1-9][0-9]*/comments)?", suffix)) or
                     (method == "PATCH" and re.fullmatch(r"/issues/[1-9][0-9]*", suffix))):
@@ -518,4 +522,4 @@ class GitHub:
                     continue
                 for run in runs["workflow_runs"]:
                     self.notify(f"ci:{repo}:{run['id']}:{run.get('run_attempt', 1)}",
-                                f"CI failed in {repo}: {run['html_url']}")
+                                f"CI failed in {repo}: https://github.com/{repo}/actions/runs/{int(run['id'])}")

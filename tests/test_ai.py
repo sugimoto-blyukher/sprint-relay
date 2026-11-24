@@ -47,7 +47,12 @@ def flow(tmp_path):
 
 
 def submit(flow, job, result):
-    return flow.jobs.complete(job["id"], "muse", job["lease_token"], result, on_submit=flow.submit_job)
+    prepared = flow.prepare_job(job, "muse", result) if job["kind"] == "task_plan" else None
+
+    def store(db, active, provider, data):
+        return flow.submit_job(db, active, provider, data, prepared=prepared)
+
+    return flow.jobs.complete(job["id"], "muse", job["lease_token"], result, on_submit=store)
 
 
 def claim(flow, meeting):
@@ -214,3 +219,35 @@ def test_spec_audit_yields_lease_and_high_finding_requires_human_revision(flow):
     assert flow.job_context(checking, "muse")["audit_result"] == result
     submit(flow, checking, validation(digest))
     assert flow.show(meeting, "22")["state"] == "NEEDS_REVISION"
+
+
+def test_preflight_releases_sqlite_writer_and_keys_reserved_across_meetings(flow, monkeypatch):
+    meeting, digest, job = accepted(flow)
+    query = flow.github.list_tasks
+
+    def read_github():
+        # A slow read-only GitHub request must not block lease heartbeats in SQLite.
+        with private_db(flow.path) as db:
+            db.execute("PRAGMA busy_timeout=1")
+            db.execute("BEGIN IMMEDIATE")
+        return query()
+
+    monkeypatch.setattr(flow.github, "list_tasks", read_github)
+    data = {"tasks": [proposal()], "digest": digest}
+    prepared = flow.prepare_job(job, "muse", data)
+    with pytest.raises(ValueError, match="Preflight must match"):
+        flow.jobs.complete(job["id"], "muse", job["lease_token"],
+            {**data, "tasks": [{**proposal(), "title": "Swapped after inspection"}]},
+            on_submit=lambda *args: flow.submit_job(*args, prepared=prepared))
+    flow.jobs.complete(job["id"], "muse", job["lease_token"], data,
+                       on_submit=lambda *args: flow.submit_job(*args, prepared=prepared))
+    assert not flow.github.issues  # Publication has not used the remote key yet.
+    from test_workflow import MINUTES as manual_minutes, report
+    second = flow.import_meeting("fixture/2", "Synthetic second meeting", "22")
+    flow.draft(second, "22", markdown=SPEC, minutes=manual_minutes)
+    revision = flow.revise(second, "22", SPEC, "Reviewed duplicate proposal")
+    flow.validate(second, "33", revision, report=report(revision))
+    with pytest.raises(ValueError, match="reserved by another approved meeting"):
+        flow.approve(second, "33", revision, tasks=[proposal()])
+    assert flow.show(second, "22")["approval"] is None
+    assert flow.show(meeting, "22")["state"] == "PUBLISHING"
