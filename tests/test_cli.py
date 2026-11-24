@@ -135,14 +135,30 @@ def test_core_uses_same_database_and_separate_mcp_listeners(tmp_path, monkeypatc
             await asyncio.Event().wait()
 
     async def start(token):
-        await asyncio.sleep(0)
         assert token == "discord"
+        await asyncio.Event().wait()
 
     async def close():
         pass
 
+    issued = []
+    from unittest.mock import create_autospec
+    from relay.worker import run_cli
+
+    async def isolated_launch(provider, **kwargs):
+        issued.append(kwargs["token"])
+        identity = boundaries[0][1]["local_tokens"].verify(issued[-1])
+        assert identity.project == cfg.management_repo and identity.job_id == "probe-1"
+        assert identity.lease_token == "fixture-lease" and identity.role == "audit"
+        assert provider == "codex" and kwargs["snapshot"] is None
+        return None
+
+    monkeypatch.setattr("relay.worker.run_cli", create_autospec(run_cli, side_effect=isolated_launch))
+
     async def watchdog(self):
-        await asyncio.Event().wait()
+        job = {"id": "probe-1", "role": "audit", "kind": "probe", "lease_token": "fixture-lease"}
+        assert await self.dispatch(job, "codex") is None
+        assert boundaries[0][1]["local_tokens"].verify(issued[-1]) is None
 
     monkeypatch.setattr("relay.github.transport", repository)
     monkeypatch.setattr("relay.mcp_server.create_app", app)

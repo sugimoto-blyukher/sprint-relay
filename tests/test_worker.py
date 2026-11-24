@@ -149,6 +149,33 @@ def test_a08_stdout_cannot_satisfy_watchdog():
     assert args == (8, "codex", "test-lease", "FORMAT")
 
 
+def audit_snapshot():
+    return {"sha": "b" * 40, "job_id": "job123", "truncated": True, "evidence": [
+        {"id": "c" * 24, "path": "src/view.py", "text": "+return 2\n+password = 'synthetic'"}]}
+
+
+def test_sealed_snapshot_contains_only_scrubbed_bound_evidence(tmp_path):
+    data = audit_snapshot()
+    req = request(snapshot=data)
+    config = worker._google_config(tmp_path, req)
+    rules = json.loads(config[0][0].read_text())["permissions"]
+    assert "read_file(/evidence/context.json)" in rules["allow"]
+    assert {"command(*)", "read_file(/session)", "read_file(/proc)", "write_file(*)"} <= set(rules["deny"])
+    with worker._mount_snapshot(["bwrap", "--remount-ro", "/", "--", "/bin/agent"],
+                                req.snapshot) as (cmd, fds):
+        assert "/evidence/context.json" in cmd and "--ro-bind-data" in cmd
+        contents = json.loads(os.pread(fds[0], 16384, 0))
+        assert contents["sha"] == data["sha"]
+        assert contents["evidence"][0]["text"] == "+return 2\n[redacted]"
+        with pytest.raises(PermissionError):
+            os.write(fds[0], b"overwrite")
+    for bad in [dict(snapshot=data, role="management"), dict(snapshot=data, job_id="other"),
+                dict(snapshot=dict(data, sha="untrusted-branch")),
+                dict(snapshot=dict(data, evidence=[dict(data["evidence"][0], path="../token.py")]))]:
+        with pytest.raises(ValidationError):
+            request(**bad)
+
+
 def test_a13_kernel_mount_boundary_when_namespaces_are_available(tmp_path, monkeypatch):
     """Actual mount/UID check on Linux hosts permitting unprivileged bwrap."""
     import shutil
@@ -162,6 +189,8 @@ def test_a13_kernel_mount_boundary_when_namespaces_are_available(tmp_path, monke
     probe.write_text(r"""
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
@@ -174,6 +203,15 @@ int main(int argc, char **argv) {
     if (statvfs("/work", &fs) != 0 || !(fs.f_flag & ST_RDONLY)) return 3;
     if (open("/work/edit", O_CREAT|O_WRONLY, 0600) >= 0) return 3;
     if (open("/session/.codex/auth.json", O_WRONLY) >= 0) return 4;
+    const char *file = "/evidence/context.json";
+    struct stat info;
+    if (stat(file, &info) || (info.st_mode & 0777) != 0400) return 5;
+    if (statvfs(file, &fs) || !(fs.f_flag & ST_RDONLY)) return 6;
+    if (open(file, O_WRONLY) >= 0) return 7;
+    char evidence[2048] = {0};
+    int fd = open(file, O_RDONLY);
+    if (fd < 0 || read(fd, evidence, sizeof(evidence)-1) < 1) return 8;
+    if (!strstr(evidence, "[redacted]") || strstr(evidence, "synthetic")) return 9;
     return 0;
 }
 """)
@@ -200,5 +238,7 @@ int main(int argc, char **argv) {
     (account / ".codex").mkdir(mode=0o700)
     (account / ".codex/auth.json").touch(mode=0o600)
     monkeypatch.setenv("SPRINT_RELAY_PRIVATE_CANARY", "host only")
-    actual = subprocess.run(worker._isolate("codex"), env=worker._agent_env(), capture_output=True, timeout=5)
+    snapshot = request(snapshot=audit_snapshot()).snapshot
+    with worker._mount_snapshot(worker._isolate("codex"), snapshot) as (cmd, fds):
+        actual = subprocess.run(cmd, env=worker._agent_env(), capture_output=True, timeout=5, pass_fds=fds)
     assert actual.returncode == 0, actual.stderr.decode()

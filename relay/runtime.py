@@ -11,7 +11,7 @@ import uvicorn
 from .bot import Service, create_client
 from .changes import ChangeManager
 from .config import load_config
-from .github import GitHub
+from .github import Conflict, GitHub, GitHubError
 from .patrol import Patrol
 from .security import OAuthVerifier, Principal, TokenVault
 from .workflow import Workflow
@@ -40,15 +40,15 @@ class Control:
 
     def pause(self, actor):
         self._authorize(actor)
-        self.store.set_paused(self.project, True)
+        self.store.set_paused(self.project, True, actor=str(actor))
 
     def resume(self, actor):
         self._authorize(actor)
-        self.store.set_paused(self.project, False)
+        self.store.set_paused(self.project, False, actor=str(actor))
 
     def patrol(self, actor):
         self._authorize(actor)
-        return self.store.patrol(self.project, force=True)
+        return self.store.patrol(self.project, force=True, actor=str(actor))
 
 
 class ConfigurationFile:
@@ -102,11 +102,24 @@ async def serve(config, config_path, path, management_token, product_token, disc
     async def dispatch(job, provider):
         identity = Principal(f"worker:{job['id']}", provider, job["role"], project, str(job["id"]))
         ttl = config.jobs.timeout_seconds
+        snapshot = None
+        if job["kind"] == "audit" and job["payload"].get("kind") in {"pr", "ci"}:
+            try:
+                snapshot = await asyncio.to_thread(patrol.cli_snapshot, str(job["id"]),
+                                                   provider=provider, lease_token=job["lease_token"])
+                # A GitHub read may have consumed the last seconds of a lease.
+                await asyncio.to_thread(jobs.require_lease, job["id"], provider, job["lease_token"])
+            except PermissionError:
+                return "PERMISSION"
+            except (Conflict, ValueError):
+                return "INPUT"
+            except (GitHubError, OSError):
+                return "DEPENDENCY"
         token = vault.issue(identity, ttl, lease_token=job["lease_token"])
         try:
             return await run_cli(provider, project=project, role=job["role"], job_id=str(job["id"]),
                                  token=token, mcp_url=f"http://127.0.0.1:{config.mcp.local_port}/mcp",
-                                 timeout_seconds=ttl, model=config.agents[provider].model)
+                                 timeout_seconds=ttl, model=config.agents[provider].model, snapshot=snapshot)
         finally:
             vault.revoke(token)
 

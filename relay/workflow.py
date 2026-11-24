@@ -126,6 +126,9 @@ def migrate_workflow(db, project=None):
     db.execute("""CREATE TABLE IF NOT EXISTS workflow_approval (
         digest TEXT PRIMARY KEY, project TEXT NOT NULL, meeting TEXT NOT NULL,
         report_hash TEXT NOT NULL, actor TEXT NOT NULL, approved_at TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS workflow_public_release (
+        digest TEXT PRIMARY KEY, project TEXT NOT NULL, meeting TEXT NOT NULL,
+        plan_hash TEXT NOT NULL, actor TEXT NOT NULL, recorded_at TEXT NOT NULL)""")
     db.execute("""CREATE TABLE IF NOT EXISTS workflow_consent (
         meeting TEXT NOT NULL, project TEXT NOT NULL, actor TEXT NOT NULL,
         recorded_at TEXT NOT NULL, providers TEXT NOT NULL)""")
@@ -164,6 +167,11 @@ def migrate_workflow(db, project=None):
                 ON a.digest=r.digest WHERE a.report_hash='' AND r.report IS NOT NULL"""):
             db.execute("UPDATE workflow_approval SET report_hash=? WHERE digest=?",
                        (_digest(json.loads(row["report"])), row["digest"]))
+        # V1 bound the revision to an approver but never recorded whether a
+        # submitted plan was generated or manually cleared for public release.
+        db.execute("""UPDATE workflow_v2 SET agent_plan=1 WHERE project=? AND state='PUBLISHING'
+            AND EXISTS(SELECT 1 FROM meeting m JOIN workflow_approval a ON a.digest=m.head
+                WHERE m.id=workflow_v2.meeting AND a.approved_at IS NULL)""", (project,))
     finally:
         db.row_factory = previous_factory
 
@@ -177,6 +185,8 @@ class Workflow:
         with private_db(path) as db:
             db.execute("BEGIN IMMEDIATE")
             migrate_workflow(db, self.project)
+        if hasattr(self.github, "projection_allowed"):
+            self.github.projection_allowed = self.projection_allowed
 
     def _member(self, actor):
         if str(actor) not in self.config.members and str(actor) not in self.config.approvers:
@@ -385,6 +395,11 @@ class Workflow:
                 raise ValueError("Revision belongs to another meeting")
             previous = self._revision(db, rev["parent"])["markdown"] if rev["parent"] else ""
             approval = db.execute("SELECT * FROM workflow_approval WHERE digest=?", (rev["digest"],)).fetchone()
+            if (row["state"] == "PUBLISHING" and row["agent_plan"] and rev["digest"] == row["head"]
+                    and str(actor) in self.config.approvers):
+                plan = json.loads(rev["plan"])
+                output["pending_plan"] = plan
+                output["plan_hash"] = _digest(plan)
             return {**output, "digest": rev["digest"], "parent": rev["parent"],
                     "markdown": rev["markdown"], "minutes": json.loads(rev["minutes"]),
                     "actor": rev["actor"], "reason": rev["reason"], "approved_by": rev["approved_by"],
@@ -503,6 +518,14 @@ class Workflow:
                     raise ValueError("Approval requires validation of the current revision")
                 if not rev["report"] or json.loads(rev["report"])["blocking_questions"]:
                     raise ValueError("Resolve blocking questions and validate before approval")
+                if isinstance(tasks, dict):
+                    if (set(tasks) != {"confirm_public_release", "plan_hash"} or
+                            tasks["confirm_public_release"] is not True or not row["agent_plan"] or
+                            row["state"] != "PUBLISHING" or not rev["approved_by"] or not rev["plan"] or
+                            tasks["plan_hash"] != _digest(json.loads(rev["plan"]))):
+                        raise ValueError("Public release must identify the exact, previously approved pending plan")
+                    db.execute("""INSERT OR IGNORE INTO workflow_public_release VALUES(?,?,?,?,?,?)""",
+                               (digest, self.project, meeting, tasks["plan_hash"], str(actor), _now()))
                 if tasks is not None and not rev["plan"]:
                     self._supersede(db, row)
                     self._stage_plan(db, row, rev, tasks, prepared, agent=False)
@@ -535,9 +558,10 @@ class Workflow:
                     approval["report_hash"] != _digest(json.loads(rev["report"]))):
                 raise ValueError("Publication requires a plan bound to the approved validation")
             old = self._revision(db, row["published"]) if row["published"] else None
+            cleared = self._public_release(db, rev)
         plan = [Task.from_dict(item) for item in json.loads(rev["plan"])]
-        if row["agent_plan"] and any(not self.github.is_private(repo) for repo in {t.repo for t in plan}):
-            raise PermissionError("Product repository visibility changed; publication is paused")
+        if row["agent_plan"] and not cleared and any(not self.github.is_private(repo) for repo in {t.repo for t in plan}):
+            raise PermissionError("Public release paused: review the stored plan and attest its hash via /spec approve")
         self.github.archive_spec(meeting, digest, rev["markdown"])
         if old:
             published = self.changes.reconcile(meeting, digest, [Task.from_dict(t) for t in json.loads(old["plan"])], plan)
@@ -547,6 +571,32 @@ class Workflow:
             db.execute("UPDATE meeting SET published=? WHERE id=? AND head=?", (digest, meeting, digest))
             self._state(db, meeting, "PUBLISHED")
         return published
+
+    def _public_release(self, db, rev):
+        release = db.execute("""SELECT plan_hash FROM workflow_public_release
+            WHERE digest=? AND project=? AND meeting=?""", (rev["digest"], self.project, rev["meeting_id"])).fetchone()
+        return bool(release and release["plan_hash"] == _digest(json.loads(rev["plan"])))
+
+    def projection_allowed(self, task):
+        """Protect also the poller's repair of already-reserved, partly projected issues."""
+        with private_db(self.path) as db:
+            for rev in db.execute("""SELECT r.* FROM revision r JOIN meeting m ON m.head=r.digest
+                    JOIN workflow_v2 v ON v.meeting=m.id WHERE v.project=? AND v.agent_plan=1
+                    AND v.state='PUBLISHING'""", (self.project,)):
+                if self._public_release(db, rev):
+                    continue
+                keys = {item["key"] for item in json.loads(rev["plan"])}
+                if self.changes:
+                    # A completed task may have a separate physical follow-up key
+                    # reserved in the canonical ledger before the service stopped.
+                    batch = db.execute("SELECT plan FROM change_batch WHERE digest=?", (rev["digest"],)).fetchone()
+                    if batch:
+                        scope = json.loads(batch["plan"])
+                        keys.update(t["key"] for t in scope["new"])
+                        keys.update(after["key"] for _, after in scope["updates"])
+                if task.key in keys:
+                    return self.github.is_private(task.repo)
+        return True
 
     def pending_for(self, provider):
         """Bounded patrol metadata restricted to this provider's consented meetings."""

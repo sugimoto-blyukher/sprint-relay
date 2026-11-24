@@ -124,7 +124,16 @@ class Gateway:
                             target.get("meeting") != bound["payload"].get("meeting") or
                             target.get("sha") != bound["payload"].get("digest")):
                         raise BoundaryError("UNAUTHORIZED")
-            return self._route(name, p, a, bound)
+            result = self._route(name, p, a, bound)
+            if name.startswith("get_") or name == "list_workflow_jobs":
+                # Network-backed reads can outlive their original lease check.
+                if bound:
+                    self._lease(p, p.job_id, p.lease_token)
+                elif a.get("lease_token"):
+                    self._lease(p, a["job_id"], a["lease_token"])
+                if name != "get_project_context" and p.provider not in self.config.privacy.project_providers:
+                    raise BoundaryError("UNAUTHORIZED")
+            return result
         except BoundaryError as exc:
             if exc.code == "UNAUTHORIZED":
                 self.reject(p, args, "PERMISSION")

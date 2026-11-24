@@ -57,12 +57,15 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, default=Path("config.toml"))
     parser.add_argument("--state-dir", type=Path, default=Path("state"))
     parser.add_argument("--dry-run", action="store_true", help="Trial migration in memory")
+    parser.add_argument("--report", action="store_true", help="Include the private latest patrol report in status")
     parser.add_argument("--output", type=Path, help="New private backup file")
     args = parser.parse_args(argv)
     path = args.state_dir / "sprint-relay.sqlite3"
     try:
         config = load_config(args.config)
         check(config)
+        if args.report and args.command != "status":
+            parser.error("--report requires status")
         if (args.dry_run and args.command != "migrate") or (args.output and args.command != "backup"):
             parser.error("Use --dry-run with migrate and --output with backup")
         if args.command == "check":
@@ -74,8 +77,13 @@ def main(argv=None):
         if args.command == "status":
             from contextlib import closing
             with closing(readonly(path)) as db:
-                print(json.dumps(dict(db.execute("SELECT state,COUNT(*) FROM jobs WHERE project=? GROUP BY state",
-                                                 (config.management_repo,)))))
+                states = dict(db.execute("SELECT state,COUNT(*) FROM jobs WHERE project=? GROUP BY state",
+                                         (config.management_repo,)))
+                result = {"jobs": states}
+                if args.report:
+                    from .patrol import latest_report
+                    result["patrol_report"] = latest_report(db, config.management_repo, config.privacy.raw_retention_days)
+                print(json.dumps(result, ensure_ascii=False, indent=2))
             return
         if args.command == "migrate" and args.dry_run:
             print("Migration verified" if migrate(path, project=config.management_repo, dry_run=True) else "Already current")

@@ -278,3 +278,22 @@ def test_credentials_are_split_and_product_branch_and_contents_writes_denied(tmp
         with pytest.raises(PermissionError):
             svc.request(method, path)
     assert [call[0] for call in calls] == ["management", "product", "management", "product"]
+
+
+def test_poll_and_calendar_cannot_bypass_pending_disclosure_review(service):
+    svc, api = service
+    # A legacy publication can have reserved two keys before either Issue POST.
+    with pytest.raises(TimeoutError):
+        api.lose_response = True
+        svc.publish([task("FIRST"), task("PRIVATE")])
+    svc.projection_allowed = lambda t: t.key != "PRIVATE"
+    svc.poll()
+    assert len(api.issues) == 1 and api.issues[1]["title"].startswith("[FIRST]")
+    pending = next(t for t in svc.list_tasks() if t.key == "PRIVATE")
+    changed = replace(pending, forecast_start="2030-01-01T12:00:00+00:00")
+    svc.publish_changes([], [(pending, changed)])
+    svc.update(replace(changed, priority=2), expected=changed)
+    assert len(api.issues) == 1
+    with pytest.raises(PermissionError):
+        svc.publish([task("FIRST"), task("PRIVATE")])
+    assert all("PRIVATE" not in issue["body"] for issue in api.issues.values())

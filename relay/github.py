@@ -83,6 +83,7 @@ class GitHub:
 
     def __init__(self, config, token, db_path, *, product_token=None, request=None):
         self.config = config
+        self.projection_allowed = None
         if request is None and (not token or not product_token or token == product_token):
             raise ValueError("Set distinct GitHub management and product credentials")
         self._management = request or transport(token)
@@ -239,6 +240,9 @@ class GitHub:
                     added = True
                 keys.append(key)
             validate_tasks([Task.from_dict(r["task"]) for r in records.values()])
+            publication = bool(tasks or operation_id)
+            if publication and any(not self._may_project(Task.from_dict(records[k]["task"])) for k in keys):
+                raise PermissionError("Product visibility requires human review before publication")
             if added:
                 try:
                     sha = self._store(records, sha, "Apply approved SprintRelay task plan")
@@ -246,7 +250,11 @@ class GitHub:
                     raise PlanConflict(str(exc)) from exc
             result = []
             for key in keys:
-                task, sha = self._ensure_issue(records, key, sha)
+                task = Task.from_dict(records[key]["task"])
+                if self._may_project(task):
+                    task, sha = self._ensure_issue(records, key, sha)
+                elif publication:
+                    raise PermissionError("Product visibility changed during publication")
                 result.append(task)
             return result
 
@@ -286,6 +294,10 @@ class GitHub:
         if issue["title"] != title and (not cached or cached[0] != issue["title"]):
             body += "\n\n**Previous GitHub title** " + issue["title"]
         return body
+
+    def _may_project(self, task):
+        # The workflow guard includes partially published v1 plans recovered on migration.
+        return self.projection_allowed is None or self.projection_allowed(task)
 
     def _ensure_issue(self, records, key, sha):
         record = records[key]
@@ -411,6 +423,8 @@ class GitHub:
             record["comment"] = comment
         validate_tasks([Task.from_dict(r["task"]) for r in records.values()])
         sha = self._store(records, sha, f"Update SprintRelay task {task.key}")
+        if not self._may_project(task):
+            return task
         if task.status in {"In Review", "Blocked"} and task.status != before.status:
             self.notify(f"transition:{task.key}:{sha}", f"{task.key} · {task.status}: {task.title}")
         task, _ = self._ensure_issue(records, task.key, sha)
@@ -504,6 +518,8 @@ class GitHub:
             actors = {login.casefold(): actor for actor, login in self.config.github_users.items() if login}
             for key in sorted(records):
                 try:
+                    if not self._may_project(Task.from_dict(records[key]["task"])):
+                        continue
                     task, sha = self._ensure_issue(records, key, sha)
                     if self._comments(task, records[key]["comment"], actors):
                         records, sha = self._load()

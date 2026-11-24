@@ -251,3 +251,57 @@ def test_preflight_releases_sqlite_writer_and_keys_reserved_across_meetings(flow
         flow.approve(second, "33", revision, tasks=[proposal()])
     assert flow.show(second, "22")["approval"] is None
     assert flow.show(meeting, "22")["state"] == "PUBLISHING"
+
+
+def test_a16_legacy_partial_plan_needs_exact_public_attestation(tmp_path):
+    from dataclasses import replace
+    import json
+    from relay.core import new_task
+    from relay.workflow import migrate_workflow
+    from test_workflow import report
+
+    config = Config({"22": "backend"}, {"33"}, {}, "team/product", "team/manage", {})
+    db_path = tmp_path / "state.sqlite"
+    meeting, digest = "legacy-meeting", "a" * 64
+    original = [new_task({**proposal(), "key": key}, config) for key in ("one", "two")]
+    frozen = json.dumps([t.to_dict() for t in original])
+    with private_db(db_path) as db:
+        migrate_workflow(db)  # No v2 metadata; original rows use the v1 format.
+        db.execute("INSERT INTO meeting VALUES(?,?,?,?,?,?)", (meeting, "source", "raw", 1, digest, None))
+        db.execute("INSERT INTO revision VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                   (digest, meeting, "parent", SPEC, "{}", "22", "Human-reviewed",
+                    json.dumps(report(digest)), "old-validator", "33", frozen))
+        db.execute("INSERT INTO revision(digest,meeting_id,markdown,minutes,actor,reason) VALUES(?,?,?,?,?,?)",
+                   ("parent", meeting, SPEC, "{}", "22", "Draft"))
+    github = ProductIssues()
+    github.private = False
+    github.issues["one"] = replace(original[0], issue=1)
+    flow = Workflow(db_path, config, github)
+    assert not flow.projection_allowed(original[0])
+    assert not flow.projection_allowed(original[1])
+    assert flow.projection_allowed(replace(original[0], key="unrelated"))
+    with pytest.raises(PermissionError, match="Public release paused"):
+        flow.recover()
+    pending = flow.show(meeting, "33")
+    assert pending["pending_plan"] == json.loads(frozen)
+    assert "pending_plan" not in flow.show(meeting, "22")
+    with pytest.raises(PermissionError):
+        flow.approve(meeting, "33", digest, tasks=[{**proposal(), "description": "overwrite"}])
+    consent = {"confirm_public_release": True, "plan_hash": pending["plan_hash"]}
+    with pytest.raises(ValueError):
+        flow.approve(meeting, "33", digest, tasks={**consent, "plan_hash": "wrong"})
+    with pytest.raises(PermissionError):
+        flow.approve(meeting, "22", digest, tasks=consent)
+    assert list(github.issues) == ["one"]
+    github.fail = True
+    with pytest.raises(OSError):
+        flow.approve(meeting, "33", digest, tasks=consent)
+    restored = Workflow(db_path, config, github)
+    restored.recover()
+    restored.recover()
+    assert [(t.key, t.issue) for t in github.list_tasks()] == [("one", 1), ("two", 2)]
+    assert restored.show(meeting, "33")["digest"] == digest
+    with private_db(db_path) as db:
+        assert db.execute("SELECT plan FROM revision WHERE digest=?", (digest,)).fetchone()[0] == frozen
+        release = db.execute("SELECT * FROM workflow_public_release").fetchone()
+        assert (release["actor"], release["plan_hash"]) == ("33", pending["plan_hash"])
