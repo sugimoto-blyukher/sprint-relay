@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from zoneinfo import ZoneInfo
 
 from .core import Task, apply_action, assign_owner, validate_tasks
@@ -35,7 +35,15 @@ class PlanConflict(Conflict):
     """The approved graph change has not been applied and may be reclassified."""
 
 
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def transport(token):
+    # Never forward a credential to a new origin or follow an unvalidated route.
+    opener = build_opener(NoRedirect())
+
     def request(method, path, data=None):
         req = Request(
             "https://api.github.com" + path,
@@ -50,8 +58,10 @@ def transport(token):
             },
         )
         try:
-            with urlopen(req, timeout=20) as response:
-                raw = response.read()
+            with opener.open(req, timeout=20) as response:
+                raw = response.read(12_000_001)
+                if len(raw) > 12_000_000:
+                    raise GitHubError(413, "response exceeds read budget")
         except HTTPError as exc:
             # GitHub error payloads can contain request data. Keep diagnostics minimal.
             raise GitHubError(exc.code, exc.reason) from exc
@@ -71,9 +81,12 @@ def digest(data):
 class GitHub:
     """Deploy one writer process. GitHub blob SHAs protect against stale writes."""
 
-    def __init__(self, config, token, db_path, *, request=None):
+    def __init__(self, config, token, db_path, *, product_token=None, request=None):
         self.config = config
-        self.request = request or transport(token)
+        if request is None and (not token or not product_token or token == product_token):
+            raise ValueError("Set distinct GitHub management and product credentials")
+        self._management = request or transport(token)
+        self._product = request or transport(product_token)
         self._lock = threading.RLock()
         if str(db_path) != ":memory:":
             file = Path(db_path)
@@ -94,6 +107,37 @@ class GitHub:
                 "CREATE TABLE IF NOT EXISTS relay_issue_cache (key TEXT PRIMARY KEY, title TEXT, body_hash TEXT)"
             )
         self._ledger = f"/repos/{config.management_repo}/contents/.sprint-relay/tasks.json"
+
+    def request(self, method, path, data=None):
+        """Only the configured repository and known operation select a credential."""
+        route = path.partition("?")[0]
+        match = re.fullmatch(r"/repos/([^/]+/[^/]+)(/.*)?", route)
+        if not match:
+            raise PermissionError("Unrecognized GitHub resource")
+        repo, suffix = match.groups()
+        suffix = suffix or ""
+        if repo == self.config.management_repo:
+            doc = r"/contents/\.sprint-relay/(?:tasks\.json|specs/[0-9a-f]{64}/[0-9a-f]{64}\.md)"
+            if ((method == "GET" and not suffix) or
+                    (method in ("GET", "PUT") and re.fullmatch(doc, suffix))):
+                return self._management(method, path, data)
+        elif repo in self.config.product_repos:
+            reads = (
+                r"", r"/issues(?:/[1-9][0-9]*(?:/comments)?)?", r"/pulls(?:/[1-9][0-9]*)?",
+                r"/actions/runs(?:/[1-9][0-9]*)?", r"/commits/[0-9a-f]{40}",
+                r"/compare/[0-9a-f]{40}\.\.\.[0-9a-f]{40}",
+            )
+            if ((method == "GET" and any(re.fullmatch(rule, suffix) for rule in reads)) or
+                    (method == "POST" and re.fullmatch(r"/issues(?:/[1-9][0-9]*/comments)?", suffix)) or
+                    (method == "PATCH" and re.fullmatch(r"/issues/[1-9][0-9]*", suffix))):
+                return self._product(method, path, data)
+        raise PermissionError("GitHub operation outside configured scope")
+
+    def is_private(self, repo):
+        value = self.request("GET", f"/repos/{repo}").get("private")
+        if type(value) is not bool:
+            raise GitHubError(503, "repository visibility unavailable")
+        return value
 
     def _load(self):
         try:
@@ -122,9 +166,9 @@ class GitHub:
         return result["content"]["sha"]
 
     def list_tasks(self):
-        with self._lock:
-            records, _ = self._load()
-            return [Task.from_dict(records[key]["task"]) for key in sorted(records)]
+        # The remote blob is an atomic snapshot. Readers do not block the poller's local writes.
+        records, _ = self._load()
+        return [Task.from_dict(records[key]["task"]) for key in sorted(records)]
 
     tasks = list_tasks
 
@@ -281,7 +325,7 @@ class GitHub:
         return task, sha
 
     def _graphql(self, query, variables):
-        res = self.request("POST", "/graphql", {"query": query, "variables": variables})
+        res = self._product("POST", "/graphql", {"query": query, "variables": variables})
         if res.get("errors"):
             # Includes unsupported fields and insufficient project scopes.
             raise GitHubError(200, str(res["errors"][0].get("type", "GraphQL error")))
@@ -427,6 +471,10 @@ class GitHub:
         route = f"/repos/{task.repo}/issues/{task.issue}/comments"
         changed = False
         for comment in self._pages(route):
+            author = comment.get("user") or {}
+            if (author.get("type") not in (None, "User") or comment.get("performed_via_github_app") or
+                    not author.get("login") or author["login"].lower().endswith("[bot]")):
+                continue
             body = (comment["body"] or "").strip()
             parts = body.split(maxsplit=2)
             if (comment["id"] <= cursor or len(parts) < 2 or parts[0] != "!relay" or
