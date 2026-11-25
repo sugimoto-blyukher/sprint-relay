@@ -88,8 +88,8 @@ def validate_task(task: Task) -> None:
         raise ValueError(f"{task.key}: title and description required")
     if task.role not in ROLES or task.status not in STATUSES:
         raise ValueError(f"{task.key}: invalid role or status")
-    if not _number(task.estimated_hours) or not 1 <= task.estimated_hours <= 4:
-        raise ValueError(f"{task.key}: estimated effort must be 1–4 hours")
+    if not _number(task.estimated_hours) or not 1 <= task.estimated_hours <= 8:
+        raise ValueError(f"{task.key}: estimated effort must be 0.5–8 hours")
     if task.remaining_hours is not None and (
         not _number(task.remaining_hours) or task.remaining_hours < 0
     ):
