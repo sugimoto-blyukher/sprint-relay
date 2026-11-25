@@ -70,7 +70,7 @@ class TaskProposal(Record):
     title: Short
     description: Text
     role: Role
-    estimated_hours: Annotated[float, Field(ge=1, le=4, allow_inf_nan=False)]
+    estimated_hours: Annotated[float, Field(ge=0.5, le=8, allow_inf_nan=False)]
     priority: int = 0
     dependencies: Annotated[list[TaskKey], Field(max_length=128)]
     requirement_ids: Annotated[list[RequirementID], Field(min_length=1, max_length=128)]
