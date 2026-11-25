@@ -40,6 +40,11 @@ MANAGEMENT = (
     "On INVALID_INPUT, correct the indicated argument within the remaining submission budget. "
     "Request audits asynchronously; release the current job without waiting for an audit. "
     "Leave scope, dates, owners, approval and completion decisions to humans."
+    "In task planning, use 0.5–8 hours per task, preferably 1–4. "
+    "Validate every task against the MCP schema before submission. "
+    "Check numeric, string and array limits, including nested fields. "
+    "On LIMIT errors, identify and correct the violated constraint. "
+    "Never resubmit an unchanged invalid payload. "
 )
 
 AUDIT = (
