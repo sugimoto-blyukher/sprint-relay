@@ -13,7 +13,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-MAX_INPUT_CORRECTIONS = 2
+MAX_INPUT_CORRECTIONS = 5
 
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS jobs (
