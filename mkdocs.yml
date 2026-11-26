@@ -1,0 +1,94 @@
+site_name: Sprint Relay Documentation
+site_description: Sprint Relay のドキュメント、運用ガイド、コマンドリファレンス
+site_url: https://sugimoto-blyukher.github.io/sprint-relay/
+repo_url: https://github.com/sugimoto-blyukher/sprint-relay
+repo_name: sugimoto-blyukher/sprint-relay
+edit_uri: ''
+docs_dir: .docs-src
+site_dir: site
+use_directory_urls: true
+
+theme:
+  name: material
+  language: ja
+  font: false
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: ダークモード
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: ライトモード
+  features:
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+plugins:
+  - search:
+      lang:
+        - ja
+        - en
+
+markdown_extensions:
+  - admonition
+  - tables
+  - md_in_html
+  - toc:
+      permalink: true
+      slugify: !!python/name:markdown.extensions.toc.slugify_unicode
+  - pymdownx.highlight
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+  links:
+    not_found: warn
+    anchors: warn
+
+nav:
+  - ホーム: index.md
+  - はじめに:
+      - 概要: overview.md
+      - クイックスタート: quickstart.md
+      - 設計思想: PHILOSOPHY.md
+      - Philosophy (English): PHILOSOPHY.en.md
+  - 取扱説明書:
+      - 会議から Issue 発行まで: docs/workflow.md
+      - Discord 操作ガイド: docs/discord.md
+      - トラブルシューティング: troubleshooting.md
+      - Linux / LXC 導入・復旧: docs/deployment.md
+      - 外部サービス連携: docs/integrations.md
+  - コマンドリファレンス:
+      - Discord と GitHub Issue: commands.md
+      - CLI とサービス管理: cli.md
+      - MCP ツール: mcp.md
+  - 技術資料:
+      - v2 仕様書: sprint-relay-v2-specification.md
+      - 初期仕様書: sprint-relay-implementation.md
+      - 受け入れテスト: docs/acceptance.md
+      - Codex Probe: docs/codex-probe.md
+      - エージェント設定: docs/agents/index.md
+      - 管理用AIへの指示: docs/agents/management.md
+      - 技術監査用AIへの指示: docs/agents/audit.md
+  - コントリビューション:
+      - 貢献ガイド: CONTRIBUTING.md
+      - Contributing (English): CONTRIBUTING.en.md
+      - 開発指針: AGENTS.md
+      - ドキュメントサイトの保守: maintainers.md

@@ -15,3 +15,7 @@ state/
 *.sqlite*
 *.pem
 *.sock
+
+# Generated documentation site
+/.docs-src/
+/site/

@@ -1,5 +1,7 @@
 # SprintRelay v2
 
+[ドキュメントサイト](https://sugimoto-blyukher.github.io/sprint-relay/)（GitHub Pages の設定・公開後） · [サイトのローカルビルド](website/maintainers.md)
+
 SprintRelay は 5 人程度のチーム向けの開発管理サービスです。Discord から取り込んだ議事録を仕様案にし、人が査読して承認した版から GitHub Issues を発行します。GitHub のタスク台帳、Projects、固定担当者の稼働時間を使った予測、ガントチャートは初版から継続して使用できます。
 
 AI 連携には MCP を使います。管理役は Muse → Claude Code CLI → Codex CLI、技術監査は Codex CLI → Antigravity CLI の順で、利用条件・同意・ヘルスを満たす候補だけがジョブを取得します。既定設定では実データをどの外部 AI にも送信しません。全候補が停止している間も、人によるタスク操作、GitHub 同期、スケジュール計算は続きます。[正式仕様書](sprint-relay-v2-specification.md)
