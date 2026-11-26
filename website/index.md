@@ -20,7 +20,7 @@ Sprint Relay は、小規模な開発チームの会議・仕様・タスク・�
 
 - **設計と開発に参加する**
 
-    [設計思想](../PHILOSOPHY.md) · [現行仕様書](../sprint-relay-v2-specification.md) · [貢献ガイド](../CONTRIBUTING.md)。
+    [設計思想](../PHILOSOPHY.md) · [現行仕様書](../sprint-relay-v2-specification.md) · [貢献ガイド](../CONTRIBUTING.md) · [セキュリティポリシー](../SECURITY.md)。
 
 </div>
 
@@ -37,6 +37,7 @@ Sprint Relay は、小規模な開発チームの会議・仕様・タスク・�
 
 - [Philosophy](../PHILOSOPHY.en.md)
 - [Contributing](../CONTRIBUTING.en.md)
+- [Security Policy](../SECURITY.en.md)
 - [Discord operator guide](../docs/discord.md)
 
 このサイトは公開ドキュメントです。実際の会議データ、認証情報、タスク台帳、運用状態は掲載しません。
