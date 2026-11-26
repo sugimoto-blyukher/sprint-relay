@@ -126,7 +126,7 @@ Not every proposal or pull request will be accepted. Final decisions are made by
 
 Do not include credentials, API keys, access tokens, private meeting records, or personal information in issues, pull requests, or commits.
 
-If you discover a security vulnerability, report it privately to the maintainers before publicly disclosing exploitable details.
+If you discover a security vulnerability, follow the [security policy](SECURITY.en.md) and report it privately to the maintainers before publicly disclosing exploitable details.
 
 ## 9. Languages
 

@@ -90,5 +90,7 @@ nav:
   - コントリビューション:
       - 貢献ガイド: CONTRIBUTING.md
       - Contributing (English): CONTRIBUTING.en.md
+      - セキュリティポリシー: SECURITY.md
+      - Security Policy (English): SECURITY.en.md
       - 開発指針: AGENTS.md
       - ドキュメントサイトの保守: maintainers.md

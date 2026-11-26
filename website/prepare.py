@@ -20,6 +20,8 @@ PAGES = {
     "PHILOSOPHY.en.md": "PHILOSOPHY.en.md",
     "CONTRIBUTING.md": "CONTRIBUTING.md",
     "CONTRIBUTING.en.md": "CONTRIBUTING.en.md",
+    "SECURITY.md": "SECURITY.md",
+    "SECURITY.en.md": "SECURITY.en.md",
     "AGENTS.md": "AGENTS.md",
     "sprint-relay-v2-specification.md": "sprint-relay-v2-specification.md",
     "sprint-relay-implementation.md": "sprint-relay-implementation.md",
