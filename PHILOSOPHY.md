@@ -1,5 +1,7 @@
 # Sprint Relayの思想
 
+**日本語** | [English](PHILOSOPHY.en.md)
+
 本書は、Sprint Relayの出発点、設計上の価値判断、そして現在の構想に対する批判を記録するものである。機能の正確な契約は[現行仕様書](sprint-relay-v2-specification.md)を参照されたい。本書で述べる今後の方向性は、実装済みの機能や検証済みの効果を意味しない。
 
 ## 1. 出発点

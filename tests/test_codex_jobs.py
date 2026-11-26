@@ -42,7 +42,7 @@ def project_calls(kind, project, forced):
                                                     sha=HEAD, question="Check coverage")
         assert audit["job_id"]
         correction = yield "publish_patrol_report", args | dict(summary="PRIVATE_REPORT", references="PRIVATE_WRONG")
-        assert correction["code"] == "INVALID_INPUT" and correction["remaining_submissions"] == 2
+        assert correction["code"] == "INVALID_INPUT" and correction["remaining_submissions"] == 5
         assert (correction["field"], correction["reason"]) == ("references", "TYPE")
         report = yield "publish_patrol_report", args | dict(summary="PRIVATE_REPORT", references=refs)
         assert report["receipt"] == "patrol:" + args["job_id"]

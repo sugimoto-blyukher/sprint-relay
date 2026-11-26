@@ -70,14 +70,21 @@ class TaskRulesTest(unittest.TestCase):
 
     def test_untrusted_task_proposals(self):
         cases = [
-            {"key": ""}, {"role": "admin"}, {"estimated_hours": 4.5}, {"estimated_hours": True},
-            {"estimated_hours": 0.1}, {"requirement_ids": []}, {"deliverables": []}, {"acceptance": []},
+            {"key": ""}, {"role": "admin"}, {"estimated_hours": 8.1}, {"estimated_hours": True},
+            {"estimated_hours": 0.49}, {"requirement_ids": []}, {"deliverables": []}, {"acceptance": []},
             {"assignee": "10105"}, {"status": "Done"}, {"repo": "other/unknown"}, {"issue": 42},
             {"deadline": "2030-01-01"}, {"dependencies": "TASK-2"}, {"priority": True},
         ]
         for edits in cases:
             with self.subTest(edits=edits), self.assertRaises(ValueError):
                 new_task(dict(self.proposal, **edits), self.config)
+
+    def test_task_estimated_effort_accepts_full_range(self):
+        for hours in (0.5, 1, 4, 4.5, 8):
+            with self.subTest(hours=hours):
+                task = new_task(dict(self.proposal, estimated_hours=hours), self.config)
+                self.assertEqual(task.estimated_hours, hours)
+                self.assertEqual(task.remaining_hours, hours)
 
     def test_validate_dependency_graph(self):
         config, proposal = self.config, self.proposal
