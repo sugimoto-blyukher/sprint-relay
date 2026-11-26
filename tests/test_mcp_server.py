@@ -278,7 +278,7 @@ def test_job_input_budget_is_shared_fenced_and_durable(system):
     # No counter or lease mutation may be triggered using an invalid argument credential.
     assert rejected("submit_minutes", args | {"lease_token": "stale", "minutes": None}).code == "LEASE_LOST"
     first = rejected("submit_minutes", args | {"minutes": {"PRIVATE_NESTED_KEY": True}})
-    assert (first.code, first.field, first.remaining) == ("INVALID_INPUT", "minutes", 2)
+    assert (first.code, first.field, first.remaining) == ("INVALID_INPUT", "minutes", 5)
     assert system.dispatch("get_transcript", principal, args)["source"] == "message-1"
     active = system.jobs.get(job)
     assert (active["lease_until"], active["attempts"], active["fence_generation"]) == (
@@ -288,9 +288,10 @@ def test_job_input_budget_is_shared_fenced_and_durable(system):
     system.jobs = JobStore(system.jobs.path, system.config)
     with ThreadPoolExecutor(max_workers=2) as pool:
         errors = list(pool.map(lambda _: rejected("get_transcript", args | {"PRIVATE_UNKNOWN": "PRIVATE_VALUE"}),
-                               range(2)))
-    assert {(e.code, e.field, e.reason, e.remaining) for e in errors} == {
-        ("INVALID_INPUT", "arguments", "UNKNOWN_FIELD", 1), ("INPUT_LIMIT", "arguments", "UNKNOWN_FIELD", 0)}
+                               range(5)))
+    assert sorted((e.code, e.field, e.reason, e.remaining) for e in errors) == sorted([
+        ("INVALID_INPUT", "arguments", "UNKNOWN_FIELD", remaining) for remaining in (1, 2, 3, 4)
+    ] + [("INPUT_LIMIT", "arguments", "UNKNOWN_FIELD", 0)])
     terminal = system.jobs.get(job)
     assert (terminal["state"], terminal["error_class"]) == ("FAILED", "INPUT")
     assert rejected("get_transcript", args).code == "LEASE_LOST"
@@ -312,7 +313,7 @@ def test_schema_error_metadata_over_mcp_is_allowlisted(system, caplog):
             assert bad.isError
             detail = bad.structuredContent
             assert (detail["field"], detail["reason"], detail["remaining_submissions"]) == (
-                "arguments", "UNKNOWN_FIELD", 2)
+                "arguments", "UNKNOWN_FIELD", 5)
             assert "field=arguments reason=UNKNOWN_FIELD" in caplog.text
             assert all(value not in str(bad) + caplog.text for value in (
                 "PRIVATE_EXTRA_KEY", "PRIVATE_ARGUMENT", token, original, lease))
@@ -367,5 +368,5 @@ def test_remote_muse_spends_only_a_verified_argument_lease(system):
         system.dispatch("submit_minutes", p, args | {"lease_token": "foreign", "minutes": {}})
     with pytest.raises(BoundaryError, match="INVALID_INPUT") as caught:
         system.dispatch("submit_minutes", p, args | {"minutes": {}})
-    assert caught.value.remaining == 2
+    assert caught.value.remaining == 5
     assert system.dispatch("get_transcript", p, args)["source"] == "message-1"
